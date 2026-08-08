@@ -1,0 +1,13 @@
+{
+  "name": "@devfinops/cli-wrapper",
+  "version": "0.1.0",
+  "description": "Wrapper around the Claude Code CLI that binds sessions to a Jira issue key for OTel telemetry attribution.",
+  "bin": {
+    "devfinops-claude": "./devfinops-claude.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

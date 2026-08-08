@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Data / runtime volumes
+landing_zone/*
+!landing_zone/.gitkeep

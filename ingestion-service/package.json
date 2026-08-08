@@ -1,0 +1,17 @@
+{
+  "name": "devfinops-ingestion-service",
+  "version": "0.1.0",
+  "description": "Parses the OTel Collector landing-zone JSONL files into Postgres and runs the active/wait-time derivation.",
+  "main": "ingest.js",
+  "scripts": {
+    "ingest": "node ingest.js"
+  },
+  "dependencies": {
+    "pg": "^8.11.5"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

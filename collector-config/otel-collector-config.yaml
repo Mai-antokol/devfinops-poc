@@ -1,0 +1,69 @@
+# otelcol-contrib config for the DevFinOps POC.
+#
+# Receives OTLP traces/metrics/logs from Claude Code sessions launched via
+# the devfinops-claude wrapper and lands each signal type as its own JSONL
+# file under ./landing_zone/. Kept as separate files (rather than one
+# combined stream) because the ingestion service in Step 2 parses each
+# signal type differently.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  file/traces:
+    path: /landing_zone/traces.jsonl
+    rotation:
+      max_megabytes: 100
+      max_days: 7
+      max_backups: 10
+    format: json
+
+  file/metrics:
+    path: /landing_zone/metrics.jsonl
+    rotation:
+      max_megabytes: 100
+      max_days: 7
+      max_backups: 10
+    format: json
+
+  file/logs:
+    path: /landing_zone/logs.jsonl
+    rotation:
+      max_megabytes: 100
+      max_days: 7
+      max_backups: 10
+    format: json
+
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 1
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/traces, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/metrics, debug]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/logs, debug]
+
+  telemetry:
+    logs:
+      level: info

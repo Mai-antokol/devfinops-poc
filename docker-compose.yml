@@ -1,0 +1,60 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: devfinops-postgres
+    environment:
+      POSTGRES_USER: devfinops
+      POSTGRES_PASSWORD: devfinops
+      POSTGRES_DB: devfinops
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./db:/docker-entrypoint-initdb.d:ro   # auto-runs schema.sql on first boot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devfinops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: devfinops-otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./collector-config/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ./landing_zone:/landing_zone
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+
+  jira-listener:
+    build: ./jira-listener
+    container_name: devfinops-jira-listener
+    environment:
+      DATABASE_URL: postgres://devfinops:devfinops@postgres:5432/devfinops
+      JIRA_WEBHOOK_SECRET: changeme
+      PORT: 4000
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: devfinops-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: devfinops
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pg_data:

@@ -1,0 +1,114 @@
+{
+  "title": "DevFinOps — AI Capability & Engineering Health",
+  "uid": "devfinops-main",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "browser",
+  "time": { "from": "now-30d", "to": "now" },
+  "refresh": "1m",
+  "panels": [
+    {
+      "id": 1,
+      "type": "barchart",
+      "title": "Ticket unit economics: C_total vs story points",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
+      "fieldConfig": {
+        "defaults": { "unit": "currencyUSD" },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "story_points" },
+            "properties": [{ "id": "unit", "value": "short" }]
+          }
+        ]
+      },
+      "options": {
+        "orientation": "horizontal",
+        "xTickLabelRotation": 0,
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT issue_key, c_total_usd, story_points FROM ticket_rollup ORDER BY c_total_usd DESC LIMIT 25;"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "barchart",
+      "title": "Time split: active developer time vs Claude wait time",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
+      "fieldConfig": {
+        "defaults": { "unit": "h" }
+      },
+      "options": {
+        "stacking": "normal",
+        "orientation": "horizontal",
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT issue_key, active_time_hours, wait_time_hours FROM ticket_rollup ORDER BY (active_time_hours + wait_time_hours) DESC LIMIT 25;"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Team AI hygiene: testing discipline % and prompt thrash ratio",
+      "description": "Testing discipline: share of commits preceded by a passing test run in the same session. Thrash ratio: prompts submitted per code-mutating tool call, session-averaged per day. Team-level trend only — see the product notes on why this deliberately avoids per-developer ranking.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+      "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0, "max": 100 }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT day AS time, testing_discipline_pct FROM testing_discipline_daily WHERE day BETWEEN $__timeFrom() AND $__timeTo() ORDER BY day;"
+        },
+        {
+          "refId": "B",
+          "format": "time_series",
+          "rawSql": "SELECT date_trunc('day', sr.session_start) AS time, AVG(pt.thrash_ratio) * 10 AS avg_thrash_ratio_x10 FROM prompt_thrash_by_session pt JOIN session_rollups sr ON sr.session_id = pt.session_id WHERE sr.session_start BETWEEN $__timeFrom() AND $__timeTo() GROUP BY 1 ORDER BY 1;"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Agent & guardrails health: subagent fan-out and budget blocks",
+      "description": "Left axis: sessions per day with subagent fan-out. Right axis: real-time guardrail blocks per day, by reason.",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+      "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT date_trunc('day', sr.session_start) AS time, COUNT(*) AS sessions_with_subagent_fanout FROM subagent_fanout_by_session sf JOIN session_rollups sr ON sr.session_id = sf.session_id WHERE sr.session_start BETWEEN $__timeFrom() AND $__timeTo() GROUP BY 1 ORDER BY 1;"
+        },
+        {
+          "refId": "B",
+          "format": "time_series",
+          "rawSql": "SELECT day AS time, reason, block_count FROM guardrail_blocks_daily WHERE day BETWEEN $__timeFrom() AND $__timeTo() ORDER BY day;"
+        }
+      ]
+    }
+  ]
+}
