@@ -1,0 +1,45 @@
+#!/usr/bin/env node
+// devfinops-installed
+'use strict';
+
+/**
+ * prepare-commit-msg (devfinops)
+ *
+ * Stamps the active devfinops session onto the commit message as trailers,
+ * so the post-commit hook (and later, ingest.js) can link a commit back to
+ * the session and ticket that produced it. Installed via
+ * cli-wrapper/install-git-hooks.js, not by git itself.
+ *
+ * No-ops entirely when DEVFINOPS_SESSION_ID isn't set — i.e. for commits
+ * made outside a devfinops-claude session, this hook does nothing.
+ *
+ * git passes: $1 = path to commit msg file, $2 = commit source
+ * (message|template|merge|squash|commit), $3 = commit sha (amend only).
+ */
+
+const fs = require('fs');
+
+function main() {
+  const msgFile = process.argv[2];
+  const sessionId = process.env.DEVFINOPS_SESSION_ID;
+  if (!msgFile || !sessionId) return;
+
+  let content = fs.readFileSync(msgFile, 'utf8');
+
+  // Don't double-stamp on amend/reword of an already-stamped commit.
+  if (content.includes('Session-Id:')) return;
+
+  const trailers = [`Session-Id: ${sessionId}`];
+  const issueKey = process.env.DEVFINOPS_ISSUE_KEY;
+  if (issueKey) trailers.push(`Jira-Issue: ${issueKey}`);
+
+  const separator = content.endsWith('\n') ? '\n' : '\n\n';
+  fs.writeFileSync(msgFile, content + separator + trailers.join('\n') + '\n');
+}
+
+try {
+  main();
+} catch (err) {
+  // Never block a commit over telemetry stamping.
+  process.stderr.write(`[devfinops] prepare-commit-msg hook failed (ignored): ${err.message}\n`);
+}

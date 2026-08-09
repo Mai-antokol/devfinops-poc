@@ -27,16 +27,32 @@
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 
 const LANDING_ZONE_DIR = process.env.LANDING_ZONE_DIR || './landing_zone';
 const DATABASE_URL = process.env.DATABASE_URL || 'postgres://devfinops:devfinops@localhost:5432/devfinops';
+// Pepper for the developer_id hash — override in any real deployment.
+// This is a POC-appropriate simplification (see docker-compose.yml's
+// POSTGRES_PASSWORD / JIRA_WEBHOOK_SECRET for the same pattern), not
+// meant to resist a targeted attacker — it exists so that dashboards
+// querying raw_spans/session_rollups/ticket_rollup directly see an
+// opaque id instead of a plain git email. See db/01_schema.sql's
+// `developers` table comment for the full rationale.
+const DEVELOPER_ID_SALT = process.env.DEVFINOPS_ID_SALT || 'devfinops-poc-default-salt-change-me';
 
 // Attribute key names as they appear in Claude Code's OTLP output.
 // See the note above — verify these against real landed data.
 const ATTR = {
   issueKey: 'jira.issue_key',
   sessionId: 'session.id',
+  // Set by cli-wrapper/devfinops-claude.js as a resource attribute. Takes
+  // priority over Claude Code's own session.id (below) when present,
+  // because it's the same id the git hooks stamp onto commit trailers —
+  // see the ATTR.wrapperSessionId comment in resolveSessionId().
+  wrapperSessionId: 'devfinops.session_id',
+  developerId: 'developer.id',
+  developerEmail: 'developer.email', // only present when developer.id resolved from a real email, not a git user.name fallback
   promptId: 'prompt.id',
   toolName: 'tool_name',
   toolParameters: 'tool_parameters', // JSON-encoded string; contains full_command for Bash
@@ -85,6 +101,47 @@ function extractFullCommand(attrs) {
   }
 }
 
+function resolveSessionId(localAttrs, resourceAttrs) {
+  // devfinops.session_id is minted by the wrapper before `claude` is
+  // spawned and is guaranteed to match what the git hooks stamped onto
+  // any commit made during the session (see cli-wrapper/devfinops-claude.js
+  // and cli-wrapper/git-hooks/post-commit) — prefer it over Claude Code's
+  // own session.id so the raw_spans/raw_events/session_rollups.session_id
+  // a git_commits row joins against is the same id, reliably. Sessions
+  // launched without the wrapper (no devfinops.session_id resource
+  // attribute) fall back to Claude Code's own span/resource session.id,
+  // unchanged from before this id existed.
+  return (
+    resourceAttrs[ATTR.wrapperSessionId] ||
+    localAttrs[ATTR.sessionId] ||
+    resourceAttrs[ATTR.sessionId] ||
+    null
+  );
+}
+
+function hashDeveloperId(rawId) {
+  if (!rawId || rawId === 'UNATTRIBUTED') return 'UNATTRIBUTED';
+  return crypto
+    .createHash('sha256')
+    .update(`${DEVELOPER_ID_SALT}:${rawId}`)
+    .digest('hex')
+    .slice(0, 16);
+}
+
+// Records the (pseudonymous id -> real identity) mapping exactly once,
+// in the one table dashboards aren't granted access to (see
+// db/05_access_control.sql) — everywhere else in the schema only ever
+// sees the hash. No-ops for UNATTRIBUTED sessions.
+async function upsertDeveloper(client, rawId, email) {
+  if (!rawId || rawId === 'UNATTRIBUTED') return;
+  await client.query(
+    `INSERT INTO developers (developer_id, git_email, display_name)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (developer_id) DO NOTHING`,
+    [hashDeveloperId(rawId), email || null, email ? null : rawId]
+  );
+}
+
 function classifySpan(spanName, attrs) {
   const name = (spanName || '').toLowerCase();
   if (name.includes('interaction')) return 'interaction';
@@ -117,11 +174,14 @@ async function ingestTraces(filePath, client) {
     for (const rs of payload.resourceSpans || []) {
       const resourceAttrs = attrListToMap(rs.resource?.attributes);
       const issueKey = resourceAttrs[ATTR.issueKey] || 'UNATTRIBUTED';
+      const rawDeveloperId = resourceAttrs[ATTR.developerId] || 'UNATTRIBUTED';
+      const developerId = hashDeveloperId(rawDeveloperId);
+      await upsertDeveloper(client, rawDeveloperId, resourceAttrs[ATTR.developerEmail]);
 
       for (const ss of rs.scopeSpans || []) {
         for (const span of ss.spans || []) {
           const spanAttrs = attrListToMap(span.attributes);
-          const sessionId = spanAttrs[ATTR.sessionId] || resourceAttrs[ATTR.sessionId] || null;
+          const sessionId = resolveSessionId(spanAttrs, resourceAttrs);
           const promptId = spanAttrs[ATTR.promptId] || null;
           const spanKind = classifySpan(span.name, spanAttrs);
           const startTs = nanosToDate(span.startTimeUnixNano);
@@ -132,9 +192,10 @@ async function ingestTraces(filePath, client) {
           await client.query(
             `INSERT INTO raw_spans (
                span_id, parent_span_id, trace_id, session_id, prompt_id,
-               issue_key, span_name, span_kind, tool_name, start_ts, end_ts,
-               cost_usd, input_tokens, output_tokens, raw_payload
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+               issue_key, developer_id, span_name, span_kind, tool_name,
+               start_ts, end_ts, cost_usd, input_tokens, output_tokens,
+               raw_payload
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
              ON CONFLICT (span_id) DO NOTHING`,
             [
               span.spanId,
@@ -143,6 +204,7 @@ async function ingestTraces(filePath, client) {
               sessionId,
               promptId,
               issueKey,
+              developerId,
               span.name,
               spanKind,
               spanAttrs[ATTR.toolName] || null,
@@ -187,6 +249,9 @@ async function ingestLogs(filePath, client) {
     for (const rl2 of payload.resourceLogs || []) {
       const resourceAttrs = attrListToMap(rl2.resource?.attributes);
       const issueKey = resourceAttrs[ATTR.issueKey] || 'UNATTRIBUTED';
+      const rawDeveloperId = resourceAttrs[ATTR.developerId] || 'UNATTRIBUTED';
+      const developerId = hashDeveloperId(rawDeveloperId);
+      await upsertDeveloper(client, rawDeveloperId, resourceAttrs[ATTR.developerEmail]);
 
       for (const sl of rl2.scopeLogs || []) {
         for (const record of sl.logRecords || []) {
@@ -198,15 +263,16 @@ async function ingestLogs(filePath, client) {
           try {
             await client.query(
               `INSERT INTO raw_events (
-                 session_id, prompt_id, issue_key, event_name, ts, tool_name,
-                 full_command, decision, success, cost_usd, input_tokens,
-                 output_tokens, raw_payload
-               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                 session_id, prompt_id, issue_key, developer_id, event_name,
+                 ts, tool_name, full_command, decision, success, cost_usd,
+                 input_tokens, output_tokens, raw_payload
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                ON CONFLICT (session_id, event_name, ts, tool_name) DO NOTHING`,
               [
-                attrs[ATTR.sessionId] || null,
+                resolveSessionId(attrs, resourceAttrs),
                 attrs[ATTR.promptId] || null,
                 issueKey,
+                developerId,
                 eventName,
                 ts,
                 attrs[ATTR.toolName] || null,
@@ -231,6 +297,72 @@ async function ingestLogs(filePath, client) {
   return { events: eventCount };
 }
 
+// ---- Git commit correlation ------------------------------------------------
+
+async function ingestGitCommits(filePath, client) {
+  if (!fs.existsSync(filePath)) {
+    console.warn(`[ingest] no git_commits file at ${filePath}, skipping`);
+    return { commits: 0 };
+  }
+
+  const rl = readline.createInterface({ input: fs.createReadStream(filePath) });
+  let commitCount = 0;
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch (e) {
+      console.warn(`[ingest] skipping malformed git_commits line: ${e.message}`);
+      continue;
+    }
+
+    if (!record.commit_sha) continue;
+
+    // record.developer_email is the git commit author email (git log
+    // %ae) — plain, since it's read from a local JSONL file, not a
+    // dashboard-facing table. Hash it the same way as everywhere else
+    // before it touches git_commits, and record the mapping. In the
+    // common case this is the same address as `git config user.email`,
+    // so it hashes to the same developer_id the session was tagged
+    // with — letting commits join to session_rollups by developer, not
+    // just by session_id.
+    const rawDeveloperId = record.developer_email || 'UNATTRIBUTED';
+    await upsertDeveloper(client, rawDeveloperId, record.developer_email);
+
+    await client.query(
+      `INSERT INTO git_commits (
+         commit_sha, session_id, issue_key, developer_id, subject,
+         files_changed, insertions, deletions, committed_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT (commit_sha) DO UPDATE SET
+         session_id    = EXCLUDED.session_id,
+         issue_key     = EXCLUDED.issue_key,
+         developer_id  = EXCLUDED.developer_id,
+         subject       = EXCLUDED.subject,
+         files_changed = EXCLUDED.files_changed,
+         insertions    = EXCLUDED.insertions,
+         deletions     = EXCLUDED.deletions,
+         committed_at  = EXCLUDED.committed_at`,
+      [
+        record.commit_sha,
+        record.session_id || null,
+        record.issue_key || null,
+        hashDeveloperId(rawDeveloperId),
+        record.subject || null,
+        Number(record.files_changed || 0),
+        Number(record.insertions || 0),
+        Number(record.deletions || 0),
+        record.committed_at || null,
+      ]
+    );
+    commitCount += 1;
+  }
+
+  return { commits: commitCount };
+}
+
 // ---- Main -----------------------------------------------------------------
 
 async function main() {
@@ -243,6 +375,9 @@ async function main() {
 
     const logsResult = await ingestLogs(path.join(LANDING_ZONE_DIR, 'logs.jsonl'), client);
     console.log(`[ingest] loaded ${logsResult.events} events`);
+
+    const commitsResult = await ingestGitCommits(path.join(LANDING_ZONE_DIR, 'git_commits.jsonl'), client);
+    console.log(`[ingest] loaded ${commitsResult.commits} git commits`);
 
     console.log('[ingest] running derivation query (session_rollups)...');
     const sql = fs.readFileSync(path.join(__dirname, '..', 'db', '04_derive_session_rollups.sql'), 'utf8');

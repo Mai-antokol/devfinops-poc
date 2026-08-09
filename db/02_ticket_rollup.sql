@@ -17,6 +17,8 @@ SELECT
     ji.story_points,
     ji.issue_type,
     COUNT(DISTINCT sr.session_id)                              AS session_count,
+    COUNT(DISTINCT sr.developer_id)                            AS developer_count,
+    ARRAY_AGG(DISTINCT sr.developer_id)                        AS developers,
     ROUND(SUM(sr.active_time_sec) / 3600.0, 3)                 AS active_time_hours,
     ROUND(SUM(sr.wait_time_sec) / 3600.0, 3)                   AS wait_time_hours,
     ROUND(SUM(sr.token_cost_usd), 4)                           AS token_cost_usd,

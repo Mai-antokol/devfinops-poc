@@ -26,6 +26,7 @@ WITH wait_time AS (
     SELECT
         session_id,
         MAX(issue_key)                     AS issue_key,
+        MAX(developer_id)                  AS developer_id,
         SUM(duration_ms) / 1000.0           AS wait_time_sec,
         MIN(start_ts)                       AS session_start,
         MAX(end_ts)                         AS session_end
@@ -40,6 +41,7 @@ turn_boundaries AS (
     SELECT
         session_id,
         issue_key,
+        developer_id,
         event_name,
         ts,
         LAG(ts) OVER (PARTITION BY session_id ORDER BY ts)         AS prev_ts,
@@ -55,6 +57,7 @@ active_gaps AS (
     SELECT
         session_id,
         issue_key,
+        developer_id,
         LEAST(
             EXTRACT(EPOCH FROM (ts - prev_ts)),
             :ceiling_seconds
@@ -69,6 +72,7 @@ active_time AS (
     SELECT
         session_id,
         MAX(issue_key)              AS issue_key,
+        MAX(developer_id)           AS developer_id,
         SUM(clamped_gap_sec)        AS active_time_sec
     FROM active_gaps
     GROUP BY session_id
@@ -85,12 +89,13 @@ token_cost AS (
 )
 
 INSERT INTO session_rollups (
-    session_id, issue_key, active_time_sec, wait_time_sec,
+    session_id, issue_key, developer_id, active_time_sec, wait_time_sec,
     token_cost_usd, session_start, session_end, computed_at
 )
 SELECT
     COALESCE(w.session_id, a.session_id, t.session_id)          AS session_id,
     COALESCE(w.issue_key, a.issue_key, 'UNATTRIBUTED')          AS issue_key,
+    COALESCE(w.developer_id, a.developer_id, 'UNATTRIBUTED')    AS developer_id,
     COALESCE(a.active_time_sec, 0)                              AS active_time_sec,
     COALESCE(w.wait_time_sec, 0)                                AS wait_time_sec,
     COALESCE(t.token_cost_usd, 0)                               AS token_cost_usd,
@@ -102,6 +107,7 @@ FULL OUTER JOIN active_time a ON a.session_id = w.session_id
 FULL OUTER JOIN token_cost  t ON t.session_id = COALESCE(w.session_id, a.session_id)
 ON CONFLICT (session_id) DO UPDATE SET
     issue_key       = EXCLUDED.issue_key,
+    developer_id    = EXCLUDED.developer_id,
     active_time_sec = EXCLUDED.active_time_sec,
     wait_time_sec   = EXCLUDED.wait_time_sec,
     token_cost_usd  = EXCLUDED.token_cost_usd,

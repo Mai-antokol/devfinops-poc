@@ -7,11 +7,15 @@ datasources:
     access: proxy
     url: postgres:5432
     database: devfinops
-    user: devfinops
+    # Read-only role scoped to the views the shipped dashboards query —
+    # see db/05_access_control.sql. Do not point this at the `devfinops`
+    # superuser; that's what let ticket_rollup's developer identity leak
+    # get exposed one panel-edit away in the first place.
+    user: grafana_reader
     isDefault: true
     jsonData:
       sslmode: disable
       postgresVersion: 1500
       timescaledb: false
     secureJsonData:
-      password: devfinops
+      password: grafana_reader

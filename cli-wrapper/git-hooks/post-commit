@@ -1,0 +1,88 @@
+#!/usr/bin/env node
+// devfinops-installed
+'use strict';
+
+/**
+ * post-commit (devfinops)
+ *
+ * Reads back the commit that was just made, pulls the Session-Id /
+ * Jira-Issue trailers stamped by prepare-commit-msg, and appends one JSON
+ * line to git_commits.jsonl in the devfinops landing zone — the same
+ * pattern the OTel collector uses for traces.jsonl / logs.jsonl, so
+ * ingest.js can pick it up the same way (see ingestGitCommits()).
+ *
+ * Commits made outside a devfinops-claude session (no Session-Id trailer)
+ * are skipped, not recorded — this file is meant to be dense with
+ * attributable commits, not a general commit log.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { execFileSync } = require('child_process');
+
+function git(args) {
+  // stdio: stderr must NOT inherit (Node's default) — otherwise the
+  // expected "fatal: ambiguous argument 'HEAD~1'" on a repo's first
+  // commit leaks straight into the developer's terminal mid-session,
+  // even though it's caught and harmless below.
+  return execFileSync('git', args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  }).trim();
+}
+
+function parseShortstat(stat) {
+  const filesM = stat.match(/(\d+) files? changed/);
+  const insM = stat.match(/(\d+) insertions?\(\+\)/);
+  const delM = stat.match(/(\d+) deletions?\(-\)/);
+  return {
+    filesChanged: filesM ? Number(filesM[1]) : 0,
+    insertions: insM ? Number(insM[1]) : 0,
+    deletions: delM ? Number(delM[1]) : 0,
+  };
+}
+
+function main() {
+  const body = git(['log', '-1', '--pretty=%B']);
+  const sessionMatch = body.match(/^Session-Id:\s*(\S+)/m);
+  if (!sessionMatch) return; // not a devfinops-attributed commit
+
+  const issueMatch = body.match(/^Jira-Issue:\s*(\S+)/m);
+  const sha = git(['rev-parse', 'HEAD']);
+  const developerEmail = git(['log', '-1', '--pretty=%ae']);
+  const committedAt = git(['log', '-1', '--pretty=%aI']);
+  const subject = git(['log', '-1', '--pretty=%s']);
+
+  let stats = { filesChanged: 0, insertions: 0, deletions: 0 };
+  try {
+    // No parent on the repo's first commit — shortstat against HEAD~1 throws;
+    // leave stats at zero rather than failing the hook.
+    stats = parseShortstat(git(['diff', '--shortstat', 'HEAD~1', 'HEAD']));
+  } catch (err) {
+    // expected for the initial commit in a repo
+  }
+
+  const record = {
+    commit_sha: sha,
+    session_id: sessionMatch[1],
+    issue_key: issueMatch ? issueMatch[1] : null,
+    developer_email: developerEmail,
+    subject,
+    files_changed: stats.filesChanged,
+    insertions: stats.insertions,
+    deletions: stats.deletions,
+    committed_at: committedAt,
+  };
+
+  const landingZoneDir = process.env.DEVFINOPS_LANDING_ZONE_DIR || './landing_zone';
+  fs.mkdirSync(landingZoneDir, { recursive: true });
+  fs.appendFileSync(path.join(landingZoneDir, 'git_commits.jsonl'), JSON.stringify(record) + '\n');
+}
+
+try {
+  main();
+} catch (err) {
+  // The commit already happened by the time this hook runs — never surface
+  // a failure here as a commit failure, just warn.
+  process.stderr.write(`[devfinops] post-commit hook failed (ignored): ${err.message}\n`);
+}
