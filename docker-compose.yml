@@ -4,7 +4,7 @@ services:
     container_name: devfinops-postgres
     environment:
       POSTGRES_USER: devfinops
-      POSTGRES_PASSWORD: devfinops
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devfinops}
       POSTGRES_DB: devfinops
     ports:
       - "5432:5432"
@@ -32,8 +32,8 @@ services:
     build: ./jira-listener
     container_name: devfinops-jira-listener
     environment:
-      DATABASE_URL: postgres://devfinops:devfinops@postgres:5432/devfinops
-      JIRA_WEBHOOK_SECRET: changeme
+      DATABASE_URL: postgres://devfinops:${POSTGRES_PASSWORD:-devfinops}@postgres:5432/devfinops
+      JIRA_WEBHOOK_SECRET: ${JIRA_WEBHOOK_SECRET:-changeme}
       PORT: 4000
     ports:
       - "4000:4000"
@@ -47,7 +47,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: devfinops
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-devfinops}
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
     volumes:
