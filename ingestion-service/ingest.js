@@ -30,7 +30,12 @@ const readline = require('readline');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 
-const LANDING_ZONE_DIR = process.env.LANDING_ZONE_DIR || './landing_zone';
+// Resolved relative to this file, not the current working directory —
+// `npm run ingest` is normally invoked from inside ingestion-service/,
+// where a `./landing_zone` default would silently point at a directory
+// that doesn't exist there instead of the repo-root one the OTel
+// Collector actually writes to (same fix as cli-wrapper's landingZoneDir).
+const LANDING_ZONE_DIR = process.env.LANDING_ZONE_DIR || path.resolve(__dirname, '..', 'landing_zone');
 const DATABASE_URL = process.env.DATABASE_URL || 'postgres://devfinops:devfinops@localhost:5432/devfinops';
 // Pepper for the developer_id hash — override in any real deployment.
 // This is a POC-appropriate simplification (see docker-compose.yml's
@@ -267,7 +272,7 @@ async function ingestLogs(filePath, client) {
                  ts, tool_name, full_command, decision, success, cost_usd,
                  input_tokens, output_tokens, raw_payload
                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-               ON CONFLICT (session_id, event_name, ts, tool_name) DO NOTHING`,
+               ON CONFLICT (session_id, event_name, ts, (COALESCE(tool_name, ''))) DO NOTHING`,
               [
                 resolveSessionId(attrs, resourceAttrs),
                 attrs[ATTR.promptId] || null,

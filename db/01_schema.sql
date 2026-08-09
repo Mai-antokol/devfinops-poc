@@ -61,12 +61,18 @@ CREATE TABLE IF NOT EXISTS raw_events (
     input_tokens      BIGINT DEFAULT 0,
     output_tokens     BIGINT DEFAULT 0,
     raw_payload       JSONB NOT NULL,
-    ingested_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    -- de-dup guard: same session+event_name+ts+tool_name shouldn't be
-    -- inserted twice if the ingestion service is re-run over the same file
-    UNIQUE (session_id, event_name, ts, tool_name)
+    ingested_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- de-dup guard: same session+event_name+ts+tool_name shouldn't be
+-- inserted twice if the ingestion service is re-run over the same file.
+-- This is an expression index on COALESCE(tool_name, ''), not a plain
+-- UNIQUE(...) column constraint, because Postgres treats NULL <> NULL in
+-- unique constraints — a plain constraint silently never de-dupes any
+-- event without a tool_name (user_prompt, stop, api_request, ...), which
+-- is most events. ingest.js's ON CONFLICT target must match this exactly.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_events_dedup
+    ON raw_events (session_id, event_name, ts, (COALESCE(tool_name, '')));
 
 CREATE INDEX IF NOT EXISTS idx_raw_events_session   ON raw_events (session_id);
 CREATE INDEX IF NOT EXISTS idx_raw_events_issue_key ON raw_events (issue_key);
