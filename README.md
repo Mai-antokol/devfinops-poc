@@ -104,6 +104,35 @@ devfinops-poc repo itself:
 node /path/to/devfinops-poc/cli-wrapper/install-git-hooks.js /path/to/your/repo
 ```
 
+## Pulling a real ticket from Jira Cloud
+
+`jira-listener.js` is the webhook-driven path (real-time, needs a Jira
+Cloud OAuth/webhook pointed at this service). `fetch-ticket.js` is a
+one-shot alternative for testing against a real workspace without
+wiring that up: it calls the Jira REST API v3 directly for one issue
+and upserts it the same way the webhook does.
+
+```sh
+cp .env.example .env   # if you haven't already
+# edit .env: JIRA_HOST, JIRA_USER_EMAIL, and a token from
+# https://id.atlassian.com/manage-profile/security/api-tokens
+
+cd jira-listener
+npm install
+node fetch-ticket.js SAM1-11   # use one of your own issue keys
+```
+
+Credentials are only ever read from `.env` / `process.env` — never put
+a real token in `.env.example`, which is committed. If a ticket's story
+points come back `null` and your project actually has them set, your
+Jira instance likely uses a different custom field id than the default
+(`customfield_10016`) — override it with `JIRA_STORY_POINTS_FIELD`.
+
+Note this only populates `jira_issues` — it won't show up in Grafana's
+ticket-economics panel until a session (real or via `ingest.js`) exists
+for the same issue key, since that panel is driven by `session_rollups`
+with Jira data joined in for context, not the other way around.
+
 ## Environment variables
 
 See [`.env.example`](.env.example) for the full list with defaults and
@@ -119,6 +148,8 @@ explanations. Summary:
 | `DEVFINOPS_ID_SALT` | `ingestion-service/ingest.js` | placeholder — change before real use |
 | `DEVFINOPS_CLAUDE_BIN` | `cli-wrapper/devfinops-claude.js` | `claude` |
 | `DEVFINOPS_OTLP_ENDPOINT` | `cli-wrapper/devfinops-claude.js` | `http://localhost:4317` |
+| `JIRA_HOST`, `JIRA_USER_EMAIL`, `JIRA_API_TOKEN` | `jira-listener/fetch-ticket.js` | none — required, no default |
+| `JIRA_STORY_POINTS_FIELD` | `jira-listener/fetch-ticket.js`, `jira-listener.js` | `customfield_10016` |
 
 Only the first three are read automatically by `docker compose` (from a
 `.env` file in the repo root, if present); the rest are for the Node

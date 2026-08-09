@@ -4,9 +4,11 @@
   "description": "Receives Jira Cloud webhooks and keeps jira_issues (status/summary/story points) in sync. No worklog access.",
   "main": "jira-listener.js",
   "scripts": {
-    "start": "node jira-listener.js"
+    "start": "node jira-listener.js",
+    "fetch-ticket": "node fetch-ticket.js"
   },
   "dependencies": {
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "pg": "^8.11.5"
   },
