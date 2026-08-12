@@ -126,6 +126,39 @@ Run without `sudo` and with `--shim-dir`/`--real-claude-bin` pointed
 somewhere else first if you want to see what it does before it touches
 system PATH config — see the script's own header comment.
 
+## How often to run `npm run ingest`
+
+There's no scheduler built into this repo — `npm run ingest` is a
+command you run, on your own cadence, via cron/`launchd`/whatever. How
+often depends on what you're trading off:
+
+- **Don't go slower than the OTel Collector's file rotation** — each
+  landing-zone file rotates at 100MB or 7 days, keeping only 10 backups
+  (`collector-config/`). `ingest.js` only ever reads from the fixed
+  `traces.jsonl`/`logs.jsonl`/`git_commits.jsonl` paths, never the
+  numbered backups rotation leaves behind — so if a run falls behind
+  that window, whatever was unread in a rotated-away file is gone for
+  good, silently. Heavier usage rotates sooner than 7 days, so the safe
+  margin shrinks with team size, not just time.
+- **Ingestion is incremental**, not a full re-read — each file's
+  (inode, byte offset) is tracked in `ingest_cursors`, so a run only
+  parses what's new since the last one. This makes running it *more*
+  often cheap on the file-reading side specifically. It doesn't make
+  everything cheap: `db/04_derive_session_rollups.sql` still recomputes
+  `session_rollups` from the full `raw_spans`/`raw_events` tables every
+  run, and the Jira auto-fetch still scans for missing keys across the
+  full table each time — both are candidates for the same kind of
+  incremental treatment later, just not built yet.
+- **Rotation is detected safely** (via each file's inode, not just
+  whether it's grown) — but detecting a rotation correctly still means
+  "start fresh at the new file," not "go recover what I missed." Running
+  often enough to stay ahead of rotation is what actually prevents loss;
+  the incremental cursor just makes each individual run cheap.
+
+Every 5–15 minutes is a reasonable default for a small team. Scale down
+to hourly for light/occasional usage, or tighter if your team is large
+enough that 100MB might turn over in less than a day.
+
 ## Pulling a real ticket from Jira Cloud
 
 `jira-listener.js` is the webhook-driven path (real-time, needs a Jira

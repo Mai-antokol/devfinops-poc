@@ -222,6 +222,34 @@ CREATE INDEX IF NOT EXISTS idx_git_commits_session   ON git_commits (session_id)
 CREATE INDEX IF NOT EXISTS idx_git_commits_issue_key ON git_commits (issue_key);
 
 -- ---------------------------------------------------------------------
+-- Ingestion cursors — lets ingest.js resume each landing-zone file from
+-- where it left off instead of re-reading from byte zero every run.
+--
+-- file_inode identifies the physical file, not just the path: the OTel
+-- Collector's rotation renames the current file to a backup name and
+-- starts a fresh file at the same path, so byte_offset alone can't tell
+-- "new file, smaller" apart from "same file, hasn't grown yet" — and
+-- comparing offset > current size specifically fails if the new file
+-- grows past the old offset before the next ingest run, which would
+-- silently skip the start of the new file instead of catching the
+-- rotation. An inode mismatch is unambiguous either way.
+--
+-- Rotation is detected correctly, but this does NOT retroactively read
+-- data left unread in a file before it got rotated away — that data
+-- only exists in a numbered backup file ingest.js never looks at. See
+-- the README's ingest-frequency guidance: this makes each run cheaper,
+-- it doesn't remove the need to run often enough to stay ahead of
+-- rotation (100MB / 7 days, 10 backups — collector-config/).
+-- ---------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ingest_cursors (
+    file_name    TEXT PRIMARY KEY,   -- 'traces.jsonl' | 'logs.jsonl' | 'git_commits.jsonl'
+    file_inode   BIGINT,             -- null until the file has been read at least once
+    byte_offset  BIGINT NOT NULL DEFAULT 0,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---------------------------------------------------------------------
 -- Config: hourly rate used in unit-economics calculation.
 -- Kept as a table (not a hardcoded constant) so it can vary per team
 -- without a code change. Single-row default for the POC.

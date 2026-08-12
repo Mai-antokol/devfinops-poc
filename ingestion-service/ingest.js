@@ -7,11 +7,22 @@
  * Reads the OTel Collector's JSONL landing-zone files (traces.jsonl,
  * logs.jsonl) and loads them into Postgres (raw_spans, raw_events).
  *
- * This is a batch/replayable ingestion for the POC — run it after a test
- * session, or on a loop/cron in a slightly more built-out version. It's
- * idempotent: re-running it against the same files won't create duplicate
- * rows (spans are keyed by span_id; events are de-duped via the unique
- * constraint on raw_events).
+ * Incremental, not a full re-read: each file's (inode, byte offset) is
+ * tracked in ingest_cursors, so a run only parses what's been appended
+ * since the last one — see readNewLines() and the ingest_cursors table
+ * comment in db/01_schema.sql for why inode (not offset-vs-size) is what
+ * detects the OTel Collector rotating a file out from under us. Rotation
+ * is detected safely, but this does NOT go back and read a rotated-away
+ * backup file for whatever was left unread in it — run often enough that
+ * you don't fall behind rotation (100MB / 7 days, 10 backups; see
+ * collector-config/ and the README's ingest-frequency guidance).
+ *
+ * Run it after a test session, or on a loop/cron in a slightly more
+ * built-out version. Idempotent on top of being incremental: re-running
+ * against the same already-seen bytes is a no-op (spans are keyed by
+ * span_id; events are de-duped via a NULL-safe unique index — see that
+ * index's comment in db/01_schema.sql for why a plain UNIQUE constraint
+ * silently didn't work here).
  *
  * NOTE ON FIELD NAMES: Claude Code's enhanced-telemetry trace/log schema is
  * beta and the exact attribute keys can shift between versions. Before
@@ -169,76 +180,171 @@ function classifySpan(spanName, attrs) {
   return 'other';
 }
 
+// ---- Incremental file reading ----------------------------------------------
+
+async function getCursor(client, fileName) {
+  const { rows } = await client.query(
+    'SELECT file_inode, byte_offset FROM ingest_cursors WHERE file_name = $1',
+    [fileName]
+  );
+  if (rows.length === 0) return { inode: null, offset: 0 };
+  return {
+    inode: rows[0].file_inode == null ? null : Number(rows[0].file_inode),
+    offset: Number(rows[0].byte_offset),
+  };
+}
+
+async function upsertCursor(client, fileName, inode, offset) {
+  await client.query(
+    `INSERT INTO ingest_cursors (file_name, file_inode, byte_offset, updated_at)
+     VALUES ($1, $2, $3, now())
+     ON CONFLICT (file_name) DO UPDATE SET
+       file_inode  = EXCLUDED.file_inode,
+       byte_offset = EXCLUDED.byte_offset,
+       updated_at  = now()`,
+    [fileName, inode, offset]
+  );
+}
+
+// Reads only what's new since `cursor`, bounded to a single stat()
+// snapshot of the file so we're never racing whatever's actively
+// appending to it. Returns whole, newline-terminated lines only — if
+// the file's last line at snapshot time has no trailing newline yet
+// (a write still in progress), it's held back rather than parsed, and
+// the returned offset stops right before it. Next run picks it up once
+// it's actually complete. Detects rotation via inode, not offset-vs-size
+// — see the ingest_cursors table comment in db/01_schema.sql for why
+// that distinction matters.
+async function readNewLines(filePath, cursor) {
+  const stats = fs.statSync(filePath);
+  const inode = stats.ino;
+  const currentSize = stats.size;
+
+  let offset = cursor.offset;
+  const rotated = cursor.inode != null && cursor.inode !== inode;
+  if (rotated) {
+    console.warn(
+      `[ingest] ${path.basename(filePath)} rotated (inode changed) — resuming from the ` +
+        `start of the new file. Anything left unread in the previous file before rotation ` +
+        `is not recovered by this run; see the README's ingest-frequency guidance.`
+    );
+    offset = 0;
+  }
+
+  if (offset >= currentSize) {
+    // Nothing new. offset > currentSize shouldn't happen once rotation
+    // is handled above, but clamp defensively rather than reading with
+    // a negative range if it ever does.
+    return { lines: [], newOffset: Math.min(offset, currentSize), inode };
+  }
+
+  const rangeSize = currentSize - offset;
+  const rl = readline.createInterface({
+    input: fs.createReadStream(filePath, { start: offset, end: currentSize - 1 }),
+  });
+
+  const lines = [];
+  let consumedBytes = 0;
+  for await (const line of rl) {
+    const lineBytes = Buffer.byteLength(line, 'utf8') + 1; // +1 for the newline
+    if (consumedBytes + lineBytes > rangeSize) {
+      // This line's bytes run past what we confirmed is on disk with a
+      // trailing newline — it's an in-progress write, not corrupt data.
+      // Stop here; don't consume or count it.
+      break;
+    }
+    lines.push(line);
+    consumedBytes += lineBytes;
+  }
+
+  return { lines, newOffset: offset + consumedBytes, inode };
+}
+
 // ---- Trace parsing --------------------------------------------------------
 
 async function ingestTraces(filePath, client) {
+  const fileName = path.resolve(filePath); // full path, not basename — avoids collisions across different LANDING_ZONE_DIR values
   if (!fs.existsSync(filePath)) {
     console.warn(`[ingest] no traces file at ${filePath}, skipping`);
     return { spans: 0 };
   }
 
-  const rl = readline.createInterface({ input: fs.createReadStream(filePath) });
+  const cursor = await getCursor(client, fileName);
+  const { lines, newOffset, inode } = await readNewLines(filePath, cursor);
+  if (lines.length === 0) {
+    if (cursor.inode !== inode) await upsertCursor(client, fileName, inode, newOffset);
+    return { spans: 0 };
+  }
+
   let spanCount = 0;
+  await client.query('BEGIN');
+  try {
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let payload;
+      try {
+        payload = JSON.parse(line);
+      } catch (e) {
+        console.warn(`[ingest] skipping malformed trace line: ${e.message}`);
+        continue;
+      }
 
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    let payload;
-    try {
-      payload = JSON.parse(line);
-    } catch (e) {
-      console.warn(`[ingest] skipping malformed trace line: ${e.message}`);
-      continue;
-    }
+      for (const rs of payload.resourceSpans || []) {
+        const resourceAttrs = attrListToMap(rs.resource?.attributes);
+        const issueKey = resourceAttrs[ATTR.issueKey] || 'UNATTRIBUTED';
+        const rawDeveloperId = resourceAttrs[ATTR.developerId] || 'UNATTRIBUTED';
+        const developerId = hashDeveloperId(rawDeveloperId);
+        await upsertDeveloper(client, rawDeveloperId, resourceAttrs[ATTR.developerEmail]);
 
-    for (const rs of payload.resourceSpans || []) {
-      const resourceAttrs = attrListToMap(rs.resource?.attributes);
-      const issueKey = resourceAttrs[ATTR.issueKey] || 'UNATTRIBUTED';
-      const rawDeveloperId = resourceAttrs[ATTR.developerId] || 'UNATTRIBUTED';
-      const developerId = hashDeveloperId(rawDeveloperId);
-      await upsertDeveloper(client, rawDeveloperId, resourceAttrs[ATTR.developerEmail]);
+        for (const ss of rs.scopeSpans || []) {
+          for (const span of ss.spans || []) {
+            const spanAttrs = attrListToMap(span.attributes);
+            const sessionId = resolveSessionId(spanAttrs, resourceAttrs);
+            const promptId = spanAttrs[ATTR.promptId] || null;
+            const spanKind = classifySpan(span.name, spanAttrs);
+            const startTs = nanosToDate(span.startTimeUnixNano);
+            const endTs = nanosToDate(span.endTimeUnixNano);
 
-      for (const ss of rs.scopeSpans || []) {
-        for (const span of ss.spans || []) {
-          const spanAttrs = attrListToMap(span.attributes);
-          const sessionId = resolveSessionId(spanAttrs, resourceAttrs);
-          const promptId = spanAttrs[ATTR.promptId] || null;
-          const spanKind = classifySpan(span.name, spanAttrs);
-          const startTs = nanosToDate(span.startTimeUnixNano);
-          const endTs = nanosToDate(span.endTimeUnixNano);
+            if (!startTs || !endTs) continue; // guard against malformed spans
 
-          if (!startTs || !endTs) continue; // guard against malformed spans
-
-          await client.query(
-            `INSERT INTO raw_spans (
-               span_id, parent_span_id, trace_id, session_id, prompt_id,
-               issue_key, developer_id, span_name, span_kind, tool_name,
-               start_ts, end_ts, cost_usd, input_tokens, output_tokens,
-               raw_payload
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-             ON CONFLICT (span_id) DO NOTHING`,
-            [
-              span.spanId,
-              span.parentSpanId || null,
-              span.traceId,
-              sessionId,
-              promptId,
-              issueKey,
-              developerId,
-              span.name,
-              spanKind,
-              spanAttrs[ATTR.toolName] || null,
-              startTs,
-              endTs,
-              Number(spanAttrs[ATTR.costUsd] || 0),
-              Number(spanAttrs[ATTR.inputTokens] || 0),
-              Number(spanAttrs[ATTR.outputTokens] || 0),
-              span,
-            ]
-          );
-          spanCount += 1;
+            await client.query(
+              `INSERT INTO raw_spans (
+                 span_id, parent_span_id, trace_id, session_id, prompt_id,
+                 issue_key, developer_id, span_name, span_kind, tool_name,
+                 start_ts, end_ts, cost_usd, input_tokens, output_tokens,
+                 raw_payload
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+               ON CONFLICT (span_id) DO NOTHING`,
+              [
+                span.spanId,
+                span.parentSpanId || null,
+                span.traceId,
+                sessionId,
+                promptId,
+                issueKey,
+                developerId,
+                span.name,
+                spanKind,
+                spanAttrs[ATTR.toolName] || null,
+                startTs,
+                endTs,
+                Number(spanAttrs[ATTR.costUsd] || 0),
+                Number(spanAttrs[ATTR.inputTokens] || 0),
+                Number(spanAttrs[ATTR.outputTokens] || 0),
+                span,
+              ]
+            );
+            spanCount += 1;
+          }
         }
       }
     }
+
+    await upsertCursor(client, fileName, inode, newOffset);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
   }
 
   return { spans: spanCount };
@@ -247,70 +353,96 @@ async function ingestTraces(filePath, client) {
 // ---- Log/event parsing -----------------------------------------------------
 
 async function ingestLogs(filePath, client) {
+  const fileName = path.resolve(filePath); // full path, not basename — avoids collisions across different LANDING_ZONE_DIR values
   if (!fs.existsSync(filePath)) {
     console.warn(`[ingest] no logs file at ${filePath}, skipping`);
     return { events: 0 };
   }
 
-  const rl = readline.createInterface({ input: fs.createReadStream(filePath) });
+  const cursor = await getCursor(client, fileName);
+  const { lines, newOffset, inode } = await readNewLines(filePath, cursor);
+  if (lines.length === 0) {
+    if (cursor.inode !== inode) await upsertCursor(client, fileName, inode, newOffset);
+    return { events: 0 };
+  }
+
   let eventCount = 0;
+  await client.query('BEGIN');
+  try {
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let payload;
+      try {
+        payload = JSON.parse(line);
+      } catch (e) {
+        console.warn(`[ingest] skipping malformed log line: ${e.message}`);
+        continue;
+      }
 
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    let payload;
-    try {
-      payload = JSON.parse(line);
-    } catch (e) {
-      console.warn(`[ingest] skipping malformed log line: ${e.message}`);
-      continue;
-    }
+      for (const rl2 of payload.resourceLogs || []) {
+        const resourceAttrs = attrListToMap(rl2.resource?.attributes);
+        const issueKey = resourceAttrs[ATTR.issueKey] || 'UNATTRIBUTED';
+        const rawDeveloperId = resourceAttrs[ATTR.developerId] || 'UNATTRIBUTED';
+        const developerId = hashDeveloperId(rawDeveloperId);
+        await upsertDeveloper(client, rawDeveloperId, resourceAttrs[ATTR.developerEmail]);
 
-    for (const rl2 of payload.resourceLogs || []) {
-      const resourceAttrs = attrListToMap(rl2.resource?.attributes);
-      const issueKey = resourceAttrs[ATTR.issueKey] || 'UNATTRIBUTED';
-      const rawDeveloperId = resourceAttrs[ATTR.developerId] || 'UNATTRIBUTED';
-      const developerId = hashDeveloperId(rawDeveloperId);
-      await upsertDeveloper(client, rawDeveloperId, resourceAttrs[ATTR.developerEmail]);
+        for (const sl of rl2.scopeLogs || []) {
+          for (const record of sl.logRecords || []) {
+            const attrs = attrListToMap(record.attributes);
+            const eventName = attrs[ATTR.eventName] || record.body?.stringValue || 'unknown';
+            const ts = nanosToDate(record.timeUnixNano);
+            if (!ts) continue;
 
-      for (const sl of rl2.scopeLogs || []) {
-        for (const record of sl.logRecords || []) {
-          const attrs = attrListToMap(record.attributes);
-          const eventName = attrs[ATTR.eventName] || record.body?.stringValue || 'unknown';
-          const ts = nanosToDate(record.timeUnixNano);
-          if (!ts) continue;
-
-          try {
-            await client.query(
-              `INSERT INTO raw_events (
-                 session_id, prompt_id, issue_key, developer_id, event_name,
-                 ts, tool_name, full_command, decision, success, cost_usd,
-                 input_tokens, output_tokens, raw_payload
-               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-               ON CONFLICT (session_id, event_name, ts, (COALESCE(tool_name, ''))) DO NOTHING`,
-              [
-                resolveSessionId(attrs, resourceAttrs),
-                attrs[ATTR.promptId] || null,
-                issueKey,
-                developerId,
-                eventName,
-                ts,
-                attrs[ATTR.toolName] || null,
-                extractFullCommand(attrs),
-                attrs[ATTR.decision] || null,
-                attrs[ATTR.success] === true || attrs[ATTR.success] === 'true',
-                Number(attrs[ATTR.costUsd] || 0),
-                Number(attrs[ATTR.inputTokens] || 0),
-                Number(attrs[ATTR.outputTokens] || 0),
-                record,
-              ]
-            );
-            eventCount += 1;
-          } catch (e) {
-            console.warn(`[ingest] failed to insert event: ${e.message}`);
+            try {
+              // A failed statement poisons the rest of an open Postgres
+              // transaction (every later query errors with "current
+              // transaction is aborted" until a ROLLBACK) — since this
+              // insert now runs inside the whole file's transaction
+              // instead of auto-committing on its own, a SAVEPOINT is
+              // what keeps one bad event from silently discarding every
+              // good event after it in the same batch, and from
+              // permanently wedging the offset on retry.
+              await client.query('SAVEPOINT event_insert');
+              await client.query(
+                `INSERT INTO raw_events (
+                   session_id, prompt_id, issue_key, developer_id, event_name,
+                   ts, tool_name, full_command, decision, success, cost_usd,
+                   input_tokens, output_tokens, raw_payload
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                 ON CONFLICT (session_id, event_name, ts, (COALESCE(tool_name, ''))) DO NOTHING`,
+                [
+                  resolveSessionId(attrs, resourceAttrs),
+                  attrs[ATTR.promptId] || null,
+                  issueKey,
+                  developerId,
+                  eventName,
+                  ts,
+                  attrs[ATTR.toolName] || null,
+                  extractFullCommand(attrs),
+                  attrs[ATTR.decision] || null,
+                  attrs[ATTR.success] === true || attrs[ATTR.success] === 'true',
+                  Number(attrs[ATTR.costUsd] || 0),
+                  Number(attrs[ATTR.inputTokens] || 0),
+                  Number(attrs[ATTR.outputTokens] || 0),
+                  record,
+                ]
+              );
+              await client.query('RELEASE SAVEPOINT event_insert');
+              eventCount += 1;
+            } catch (e) {
+              await client.query('ROLLBACK TO SAVEPOINT event_insert');
+              console.warn(`[ingest] failed to insert event: ${e.message}`);
+            }
           }
         }
       }
     }
+
+    await upsertCursor(client, fileName, inode, newOffset);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
   }
 
   return { events: eventCount };
@@ -319,64 +451,79 @@ async function ingestLogs(filePath, client) {
 // ---- Git commit correlation ------------------------------------------------
 
 async function ingestGitCommits(filePath, client) {
+  const fileName = path.resolve(filePath); // full path, not basename — avoids collisions across different LANDING_ZONE_DIR values
   if (!fs.existsSync(filePath)) {
     console.warn(`[ingest] no git_commits file at ${filePath}, skipping`);
     return { commits: 0 };
   }
 
-  const rl = readline.createInterface({ input: fs.createReadStream(filePath) });
-  let commitCount = 0;
+  const cursor = await getCursor(client, fileName);
+  const { lines, newOffset, inode } = await readNewLines(filePath, cursor);
+  if (lines.length === 0) {
+    if (cursor.inode !== inode) await upsertCursor(client, fileName, inode, newOffset);
+    return { commits: 0 };
+  }
 
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    let record;
-    try {
-      record = JSON.parse(line);
-    } catch (e) {
-      console.warn(`[ingest] skipping malformed git_commits line: ${e.message}`);
-      continue;
+  let commitCount = 0;
+  await client.query('BEGIN');
+  try {
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch (e) {
+        console.warn(`[ingest] skipping malformed git_commits line: ${e.message}`);
+        continue;
+      }
+
+      if (!record.commit_sha) continue;
+
+      // record.developer_email is the git commit author email (git log
+      // %ae) — plain, since it's read from a local JSONL file, not a
+      // dashboard-facing table. Hash it the same way as everywhere else
+      // before it touches git_commits, and record the mapping. In the
+      // common case this is the same address as `git config user.email`,
+      // so it hashes to the same developer_id the session was tagged
+      // with — letting commits join to session_rollups by developer, not
+      // just by session_id.
+      const rawDeveloperId = record.developer_email || 'UNATTRIBUTED';
+      await upsertDeveloper(client, rawDeveloperId, record.developer_email);
+
+      await client.query(
+        `INSERT INTO git_commits (
+           commit_sha, session_id, issue_key, developer_id, subject,
+           files_changed, insertions, deletions, committed_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (commit_sha) DO UPDATE SET
+           session_id    = EXCLUDED.session_id,
+           issue_key     = EXCLUDED.issue_key,
+           developer_id  = EXCLUDED.developer_id,
+           subject       = EXCLUDED.subject,
+           files_changed = EXCLUDED.files_changed,
+           insertions    = EXCLUDED.insertions,
+           deletions     = EXCLUDED.deletions,
+           committed_at  = EXCLUDED.committed_at`,
+        [
+          record.commit_sha,
+          record.session_id || null,
+          record.issue_key || null,
+          hashDeveloperId(rawDeveloperId),
+          record.subject || null,
+          Number(record.files_changed || 0),
+          Number(record.insertions || 0),
+          Number(record.deletions || 0),
+          record.committed_at || null,
+        ]
+      );
+      commitCount += 1;
     }
 
-    if (!record.commit_sha) continue;
-
-    // record.developer_email is the git commit author email (git log
-    // %ae) — plain, since it's read from a local JSONL file, not a
-    // dashboard-facing table. Hash it the same way as everywhere else
-    // before it touches git_commits, and record the mapping. In the
-    // common case this is the same address as `git config user.email`,
-    // so it hashes to the same developer_id the session was tagged
-    // with — letting commits join to session_rollups by developer, not
-    // just by session_id.
-    const rawDeveloperId = record.developer_email || 'UNATTRIBUTED';
-    await upsertDeveloper(client, rawDeveloperId, record.developer_email);
-
-    await client.query(
-      `INSERT INTO git_commits (
-         commit_sha, session_id, issue_key, developer_id, subject,
-         files_changed, insertions, deletions, committed_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       ON CONFLICT (commit_sha) DO UPDATE SET
-         session_id    = EXCLUDED.session_id,
-         issue_key     = EXCLUDED.issue_key,
-         developer_id  = EXCLUDED.developer_id,
-         subject       = EXCLUDED.subject,
-         files_changed = EXCLUDED.files_changed,
-         insertions    = EXCLUDED.insertions,
-         deletions     = EXCLUDED.deletions,
-         committed_at  = EXCLUDED.committed_at`,
-      [
-        record.commit_sha,
-        record.session_id || null,
-        record.issue_key || null,
-        hashDeveloperId(rawDeveloperId),
-        record.subject || null,
-        Number(record.files_changed || 0),
-        Number(record.insertions || 0),
-        Number(record.deletions || 0),
-        record.committed_at || null,
-      ]
-    );
-    commitCount += 1;
+    await upsertCursor(client, fileName, inode, newOffset);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
   }
 
   return { commits: commitCount };
