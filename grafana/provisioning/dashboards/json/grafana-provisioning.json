@@ -2,7 +2,7 @@
   "title": "DevFinOps — AI Capability & Engineering Health",
   "uid": "devfinops-main",
   "schemaVersion": 39,
-  "version": 3,
+  "version": 4,
   "editable": true,
   "timezone": "browser",
   "time": { "from": "now-30d", "to": "now" },
@@ -122,7 +122,7 @@
           {
             "matcher": { "id": "byName", "options": "active_time_hours" },
             "properties": [
-              { "id": "displayName", "value": "Active (h)" },
+              { "id": "displayName", "value": "Active (h, est.)" },
               { "id": "unit", "value": "h" },
               { "id": "decimals", "value": 2 }
             ]
@@ -173,7 +173,8 @@
     {
       "id": 6,
       "type": "barchart",
-      "title": "Time split: active developer time vs Claude wait time",
+      "title": "Time split: active developer time (estimate) vs Claude wait time",
+      "description": "Active time is a heuristic estimate, not a measurement: clamped gaps between a Stop event and the next prompt (see db/04_derive_session_rollups.sql). Reliable only for interactive sessions — non-interactive/-p sessions don't emit Stop events and will always show 0 here regardless of real elapsed time.",
       "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
       "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
       "fieldConfig": {
@@ -182,7 +183,7 @@
           {
             "matcher": { "id": "byName", "options": "active_time_hours" },
             "properties": [
-              { "id": "displayName", "value": "Active (developer)" },
+              { "id": "displayName", "value": "Active (developer, est.)" },
               { "id": "color", "value": { "mode": "fixed", "fixedColor": "#3987e5" } }
             ]
           },
