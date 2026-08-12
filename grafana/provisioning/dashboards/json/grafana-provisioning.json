@@ -2,7 +2,7 @@
   "title": "DevFinOps — AI Capability & Engineering Health",
   "uid": "devfinops-main",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": true,
   "timezone": "browser",
   "time": { "from": "now-30d", "to": "now" },
@@ -10,45 +10,197 @@
   "panels": [
     {
       "id": 1,
-      "type": "barchart",
-      "title": "Ticket unit economics: C_total vs story points",
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "type": "stat",
+      "title": "Total spend",
+      "description": "Sum of C_total across every ticket with at least one ingested session.",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
       "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
       "fieldConfig": {
-        "defaults": { "unit": "currencyUSD" },
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "color": { "mode": "fixed", "fixedColor": "#3987e5" }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        { "refId": "A", "format": "table", "rawSql": "SELECT COALESCE(SUM(c_total_usd), 0) AS total_spend FROM ticket_rollup;" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Tickets tracked",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "fixed", "fixedColor": "#c3c2b7" }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        { "refId": "A", "format": "table", "rawSql": "SELECT COUNT(*) AS tickets FROM ticket_rollup;" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Sessions ingested",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "fixed", "fixedColor": "#c3c2b7" }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        { "refId": "A", "format": "table", "rawSql": "SELECT COUNT(*) AS sessions FROM session_rollups;" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Commits correlated",
+      "description": "Commits linked back to the session that produced them via the git hooks.",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "fixed", "fixedColor": "#c3c2b7" }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        { "refId": "A", "format": "table", "rawSql": "SELECT COUNT(*) AS commits FROM git_commits;" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Ticket cost leaderboard",
+      "description": "Every ticket with at least one ingested session, highest cost first.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" } }
+        },
         "overrides": [
+          { "matcher": { "id": "byName", "options": "issue_key" }, "properties": [{ "id": "displayName", "value": "Ticket" }] },
+          { "matcher": { "id": "byName", "options": "summary" }, "properties": [{ "id": "displayName", "value": "Summary" }] },
+          { "matcher": { "id": "byName", "options": "status" }, "properties": [{ "id": "displayName", "value": "Status" }] },
+          { "matcher": { "id": "byName", "options": "session_count" }, "properties": [{ "id": "displayName", "value": "Sessions" }] },
           {
-            "matcher": { "id": "byName", "options": "story_points" },
-            "properties": [{ "id": "unit", "value": "short" }]
+            "matcher": { "id": "byName", "options": "active_time_hours" },
+            "properties": [
+              { "id": "displayName", "value": "Active (h)" },
+              { "id": "unit", "value": "h" },
+              { "id": "decimals", "value": 2 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "wait_time_hours" },
+            "properties": [
+              { "id": "displayName", "value": "Wait (h)" },
+              { "id": "unit", "value": "h" },
+              { "id": "decimals", "value": 2 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "c_total_usd" },
+            "properties": [
+              { "id": "displayName", "value": "C_total" },
+              { "id": "unit", "value": "currencyUSD" },
+              { "id": "decimals", "value": 2 },
+              { "id": "color", "value": { "mode": "thresholds" } },
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "#0ca30c", "value": null },
+                    { "color": "#fab219", "value": 50 },
+                    { "color": "#d03b3b", "value": 150 }
+                  ]
+                }
+              }
+            ]
           }
         ]
       },
       "options": {
-        "orientation": "horizontal",
-        "xTickLabelRotation": 0,
-        "legend": { "displayMode": "list", "placement": "bottom" }
+        "showHeader": true,
+        "cellHeight": "sm"
       },
       "targets": [
         {
           "refId": "A",
           "format": "table",
-          "rawSql": "SELECT issue_key, c_total_usd, story_points FROM ticket_rollup ORDER BY c_total_usd DESC LIMIT 25;"
+          "rawSql": "SELECT issue_key, summary, status, session_count, active_time_hours, wait_time_hours, c_total_usd FROM ticket_rollup ORDER BY c_total_usd DESC LIMIT 50;"
         }
       ]
     },
     {
-      "id": 2,
+      "id": 6,
       "type": "barchart",
       "title": "Time split: active developer time vs Claude wait time",
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
       "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
       "fieldConfig": {
-        "defaults": { "unit": "h" }
+        "defaults": { "unit": "h" },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "active_time_hours" },
+            "properties": [
+              { "id": "displayName", "value": "Active (developer)" },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#3987e5" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "wait_time_hours" },
+            "properties": [
+              { "id": "displayName", "value": "Wait (Claude)" },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#d95926" } }
+            ]
+          }
+        ]
       },
       "options": {
         "stacking": "normal",
         "orientation": "horizontal",
-        "legend": { "displayMode": "list", "placement": "bottom" }
+        "showValue": "auto",
+        "xTickLabelRotation": 0,
+        "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" }
       },
       "targets": [
         {
@@ -59,54 +211,100 @@
       ]
     },
     {
-      "id": 3,
+      "id": 7,
       "type": "timeseries",
-      "title": "Team AI hygiene: testing discipline % and prompt thrash ratio",
-      "description": "Testing discipline: share of commits preceded by a passing test run in the same session. Thrash ratio: prompts submitted per code-mutating tool call, session-averaged per day. Team-level trend only — see the product notes on why this deliberately avoids per-developer ranking.",
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+      "title": "Testing discipline",
+      "description": "Share of commits preceded by a passing test run in the same session. Team-level trend only — see the product notes on why this deliberately avoids per-developer ranking.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
       "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
       "fieldConfig": {
-        "defaults": { "unit": "percent", "min": 0, "max": 100 }
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": { "mode": "fixed", "fixedColor": "#3987e5" },
+          "custom": { "lineWidth": 2, "fillOpacity": 15, "drawStyle": "line", "spanNulls": false }
+        }
       },
-      "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" }
-      },
+      "options": { "legend": { "showLegend": false } },
       "targets": [
         {
           "refId": "A",
           "format": "time_series",
           "rawSql": "SELECT day AS time, testing_discipline_pct FROM testing_discipline_daily WHERE day BETWEEN $__timeFrom() AND $__timeTo() ORDER BY day;"
-        },
-        {
-          "refId": "B",
-          "format": "time_series",
-          "rawSql": "SELECT date_trunc('day', sr.session_start) AS time, AVG(pt.thrash_ratio) * 10 AS avg_thrash_ratio_x10 FROM prompt_thrash_by_session pt JOIN session_rollups sr ON sr.session_id = pt.session_id WHERE sr.session_start BETWEEN $__timeFrom() AND $__timeTo() GROUP BY 1 ORDER BY 1;"
         }
       ]
     },
     {
-      "id": 4,
+      "id": 8,
       "type": "timeseries",
-      "title": "Agent & guardrails health: subagent fan-out and budget blocks",
-      "description": "Left axis: sessions per day with subagent fan-out. Right axis: real-time guardrail blocks per day, by reason.",
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+      "title": "Prompt thrash ratio",
+      "description": "Prompts submitted per code-mutating tool call (Edit/Write), session-averaged per day. Higher means more back-and-forth for the same code output. Shown in its own natural units — not rescaled to share an axis with another metric.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
       "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
       "fieldConfig": {
-        "defaults": { "unit": "short" }
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": { "mode": "fixed", "fixedColor": "#3987e5" },
+          "custom": { "lineWidth": 2, "fillOpacity": 15, "drawStyle": "line", "spanNulls": false }
+        }
       },
-      "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" }
-      },
+      "options": { "legend": { "showLegend": false } },
       "targets": [
         {
           "refId": "A",
           "format": "time_series",
-          "rawSql": "SELECT date_trunc('day', sr.session_start) AS time, COUNT(*) AS sessions_with_subagent_fanout FROM subagent_fanout_by_session sf JOIN session_rollups sr ON sr.session_id = sf.session_id WHERE sr.session_start BETWEEN $__timeFrom() AND $__timeTo() GROUP BY 1 ORDER BY 1;"
+          "rawSql": "SELECT date_trunc('day', sr.session_start) AS time, AVG(pt.thrash_ratio) AS avg_thrash_ratio FROM prompt_thrash_by_session pt JOIN session_rollups sr ON sr.session_id = pt.session_id WHERE sr.session_start BETWEEN $__timeFrom() AND $__timeTo() GROUP BY 1 ORDER BY 1;"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Agentic & guardrails health — fills in with more usage",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 21 },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 10,
+          "type": "timeseries",
+          "title": "Sessions with subagent fan-out",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+          "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "color": { "mode": "fixed", "fixedColor": "#3987e5" },
+              "custom": { "lineWidth": 2, "fillOpacity": 15, "drawStyle": "line" }
+            }
+          },
+          "options": { "legend": { "showLegend": false } },
+          "targets": [
+            {
+              "refId": "A",
+              "format": "time_series",
+              "rawSql": "SELECT date_trunc('day', sr.session_start) AS time, COUNT(*) AS sessions_with_subagent_fanout FROM subagent_fanout_by_session sf JOIN session_rollups sr ON sr.session_id = sf.session_id WHERE sr.session_start BETWEEN $__timeFrom() AND $__timeTo() GROUP BY 1 ORDER BY 1;"
+            }
+          ]
         },
         {
-          "refId": "B",
-          "format": "time_series",
-          "rawSql": "SELECT day AS time, reason, block_count FROM guardrail_blocks_daily WHERE day BETWEEN $__timeFrom() AND $__timeTo() ORDER BY day;"
+          "id": 11,
+          "type": "timeseries",
+          "title": "Guardrail blocks by reason",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+          "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
+          "fieldConfig": {
+            "defaults": { "unit": "short" }
+          },
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" } },
+          "targets": [
+            {
+              "refId": "A",
+              "format": "time_series",
+              "rawSql": "SELECT day AS time, reason, block_count FROM guardrail_blocks_daily WHERE day BETWEEN $__timeFrom() AND $__timeTo() ORDER BY day;"
+            }
+          ]
         }
       ]
     }

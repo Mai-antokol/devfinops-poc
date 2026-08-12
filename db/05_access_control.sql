@@ -12,10 +12,15 @@
 -- This creates a read-only role scoped to exactly the views the shipped
 -- dashboards query (see grafana/provisioning/dashboards/json/
 -- grafana-provisioning.json) and deliberately does NOT grant it access
--- to `developers`, raw_spans, raw_events, or git_commits. Extend the
--- GRANT below one view at a time if a future panel needs more — resist
--- "GRANT SELECT ON ALL TABLES IN SCHEMA public", since that's exactly
--- the blanket access this file exists to remove.
+-- to `developers`, raw_spans, or raw_events. Extend the GRANT below one
+-- view at a time if a future panel needs more — resist "GRANT SELECT ON
+-- ALL TABLES IN SCHEMA public", since that's exactly the blanket access
+-- this file exists to remove.
+--
+-- git_commits IS granted (below) — its developer_id column is already
+-- the same salted hash as everywhere else, never the plain git_email
+-- (that only ever lives in `developers`), so exposing it carries the
+-- same coaching-not-leaderboard posture as session_rollups.
 --
 -- Password is a POC-appropriate placeholder, same as POSTGRES_PASSWORD /
 -- JIRA_WEBHOOK_SECRET elsewhere in this repo — rotate it for anything
@@ -43,5 +48,6 @@ GRANT SELECT ON
     testing_discipline_daily,
     prompt_thrash_by_session,
     subagent_fanout_by_session,
-    guardrail_blocks_daily
+    guardrail_blocks_daily,
+    git_commits
 TO grafana_reader;
