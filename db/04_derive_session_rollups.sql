@@ -105,8 +105,20 @@ SELECT
 FROM wait_time w
 FULL OUTER JOIN active_time a ON a.session_id = w.session_id
 FULL OUTER JOIN token_cost  t ON t.session_id = COALESCE(w.session_id, a.session_id)
+-- issue_key is pinned once a human has promoted an AI-suggested
+-- attribution (session_rollups.attribution_source = 'ai_confirmed') —
+-- otherwise this full recompute would silently overwrite a confirmed
+-- issue_key back to UNATTRIBUTED on every subsequent ingest run, since
+-- the raw OTel tag on the underlying spans/events never changes. Every
+-- other column, and attribution_source itself, still recomputes
+-- normally — attribution_source isn't listed here at all, so ON
+-- CONFLICT leaves it untouched, which is what we want.
 ON CONFLICT (session_id) DO UPDATE SET
-    issue_key       = EXCLUDED.issue_key,
+    issue_key       = CASE
+                           WHEN session_rollups.attribution_source = 'ai_confirmed'
+                           THEN session_rollups.issue_key
+                           ELSE EXCLUDED.issue_key
+                       END,
     developer_id    = EXCLUDED.developer_id,
     active_time_sec = EXCLUDED.active_time_sec,
     wait_time_sec   = EXCLUDED.wait_time_sec,

@@ -104,6 +104,28 @@ devfinops-poc repo itself:
 node /path/to/devfinops-poc/cli-wrapper/install-git-hooks.js /path/to/your/repo
 ```
 
+### Never having to remember `devfinops-claude` at all
+
+Instead of typing the wrapper name, install a PATH-priority shim so
+plain `claude` — however it's invoked, including from an IDE extension
+or CI, which a shell alias would never catch — transparently resolves
+to the wrapper. A shim beats a shell alias because an alias is only
+consulted by an interactive shell that sourced its dotfile; an IDE
+extension or CI invocation skips it entirely via a plain PATH search
+(see `cli-wrapper/shim/claude.template`'s own comment for more). macOS
+only for now — the Windows/Intune equivalent is a machine-level `PATH`
+policy plus a Win32 app dropping the same idea in as `claude.exe`:
+
+```sh
+sudo cli-wrapper/install-path-shim.sh
+# open a NEW terminal window — /etc/paths.d changes only apply to new login shells
+which claude   # should now print the shim's path, not the real binary's
+```
+
+Run without `sudo` and with `--shim-dir`/`--real-claude-bin` pointed
+somewhere else first if you want to see what it does before it touches
+system PATH config — see the script's own header comment.
+
 ## Pulling a real ticket from Jira Cloud
 
 `jira-listener.js` is the webhook-driven path (real-time, needs a Jira
@@ -133,6 +155,156 @@ ticket-economics panel until a session (real or via `ingest.js`) exists
 for the same issue key, since that panel is driven by `session_rollups`
 with Jira data joined in for context, not the other way around.
 
+## Testing & Attribution Guide
+
+How a session ends up tied (or not tied) to a Jira ticket, end to end.
+
+### How a session gets a ticket key
+
+Two ways, both handled entirely by `cli-wrapper/devfinops-claude.js`
+before it ever spawns the real `claude` process:
+
+1. **Explicit** — pass `--issue`:
+   ```sh
+   devfinops-claude --issue PROJ-101 -p "refactor the auth module"
+   ```
+2. **Implicit, via branch name** — if `--issue` isn't given, the wrapper
+   regex-matches your current git branch against `PROJ-101`-shaped keys
+   (`([A-Z][A-Z0-9]{1,9}-\d+)`), so `feature/PROJ-101-fix-auth` resolves
+   the same as passing `--issue PROJ-101` explicitly. A branch like
+   `fix-auth-bug` has no such key in it and won't match.
+
+Either way, the resolved key (or the literal string `UNATTRIBUTED` if
+neither resolved anything) is injected into `OTEL_RESOURCE_ATTRIBUTES`
+as `jira.issue_key`, and flows through `ingest.js` into every table
+that carries `issue_key`. Nothing here calls Jira's API — it's a label
+attached at session start, not a live lookup. `jira_issues` (populated
+separately by the webhook or `fetch-ticket.js`) only gets joined in
+later, for context, when something reads `ticket_rollup`.
+
+### What happens when a session lands `UNATTRIBUTED`
+
+The session isn't lost — it's fully ingested and costed, just with
+`issue_key = 'UNATTRIBUTED'`, which is exactly what makes it findable
+for follow-up:
+
+```sh
+docker exec devfinops-postgres psql -U devfinops -d devfinops -c \
+  "SELECT session_id, developer_id, token_cost_usd FROM session_rollups WHERE issue_key = 'UNATTRIBUTED';"
+```
+
+Two resolution paths are **designed and schema-ready, not yet
+automated** — there is no running job that does this for you today:
+
+- **Single-candidate shortcut**: if `jira_issues.assignee_email` (see
+  above) shows exactly one ticket in an active status assigned to that
+  session's developer, that's a deterministic match — no inference
+  needed, just a query joining `session_rollups.developer_id` through
+  `developers.git_email` to `jira_issues.assignee_email`.
+- **AI-inferred suggestion queue** (`session_attribution_suggestions`
+  table): for the ambiguous remainder, a future backend job would rank
+  candidate tickets and write a row per suggestion — `confidence_score`,
+  a `rationale` a human can actually read, and `signals_used` (JSONB,
+  privacy-safe signals only: tool commands, file paths, commit
+  subjects — see the table's own comment on why prompt content isn't in
+  there by default).
+
+Nothing in this queue ever touches cost data on its own: an unconfirmed
+guess is worse than an honest `UNATTRIBUTED`, since it would silently
+corrupt the wrong ticket's cost instead of leaving a visible gap. A
+suggestion only becomes real once a human reviews and confirms it,
+promoting it into `session_rollups`:
+
+```sql
+-- confirm suggestion <uuid>: pin the session to the suggested ticket
+UPDATE session_rollups
+SET issue_key = (SELECT suggested_issue_key FROM session_attribution_suggestions WHERE suggestion_id = '<uuid>'),
+    attribution_source = 'ai_confirmed'
+WHERE session_id = (SELECT session_id FROM session_attribution_suggestions WHERE suggestion_id = '<uuid>');
+
+UPDATE session_attribution_suggestions
+SET status = 'confirmed', reviewed_at = now()
+WHERE suggestion_id = '<uuid>';
+```
+
+```sql
+-- reject it instead: leave the session UNATTRIBUTED, just close the suggestion
+UPDATE session_attribution_suggestions
+SET status = 'rejected', reviewed_at = now()
+WHERE suggestion_id = '<uuid>';
+```
+
+Once confirmed, `attribution_source = 'ai_confirmed'` is pinned —
+`db/04_derive_session_rollups.sql`'s full recompute on every `ingest.js`
+run will keep refreshing everything else about that session (cost,
+active/wait time) but will not revert the promoted `issue_key` back to
+`UNATTRIBUTED`. That's deliberate, not an oversight — see the comment
+right above the `ON CONFLICT` clause in that file before changing it.
+
+### Architecture: how the pieces connect, for testing locally
+
+```
+ claude (typed / IDE / CI)
+        │  PATH search finds the shim first (cli-wrapper/shim/, via
+        │  /etc/paths.d — see cli-wrapper/install-path-shim.sh)
+        ▼
+ devfinops-claude wrapper
+        │  resolves issue key (explicit/branch) + developer id (git email)
+        │  mints a session id, tags OTEL_RESOURCE_ATTRIBUTES
+        │  execs the REAL claude binary (DEVFINOPS_CLAUDE_BIN)
+        ▼
+ real Claude Code session
+        │  OTLP export (traces/logs) ──────────────► OTel Collector
+        │  git commit, if any, during the session          │ file exporter
+        │  (needs cli-wrapper/git-hooks/ installed          ▼
+        │   in THAT repo — see install-git-hooks.js)  landing_zone/*.jsonl
+        │        │                                          │
+        │        ▼                                          │
+        │  git_commits.jsonl  ◄───────────────────────────────
+        │        │
+        ▼        ▼
+   ingestion-service/ingest.js  (npm run ingest)
+        │  hashes developer_id, resolves session_id priority,
+        │  loads raw_spans / raw_events / git_commits,
+        │  runs db/04_derive_session_rollups.sql
+        ▼
+   Postgres (session_rollups, ticket_rollup, ...)
+        │                                    ▲
+        │                          jira_issues, separately, via
+        │                   jira-listener.js (webhook) or
+        ▼                   fetch-ticket.js (one-shot pull)
+   Grafana (grafana_reader role — see db/05_access_control.sql)
+```
+
+To exercise this whole path locally without spending real Claude Code
+usage, point `DEVFINOPS_CLAUDE_BIN` at any stand-in that creates a file
+and commits it — the wrapper, hooks, and ingestion don't care whether
+the child process is the real `claude` or not, only that it behaves
+like a normal process the shell spawns:
+
+```sh
+cat > /tmp/fake-claude <<'EOF'
+#!/bin/sh
+echo "test" > devfinops-test.md
+git add devfinops-test.md
+git commit -m "devfinops pipeline test"
+EOF
+chmod +x /tmp/fake-claude
+
+cd /path/to/a/repo/with/the/git/hooks/installed
+DEVFINOPS_CLAUDE_BIN=/tmp/fake-claude node /path/to/devfinops-poc/cli-wrapper/devfinops-claude.js --issue PROJ-101
+```
+
+Then `npm run ingest` in `ingestion-service/` and check `git_commits` for
+a real row — `commit_sha`, `session_id`, `issue_key` all genuine, tied to
+an actual commit trailer, no Claude Code usage required. This proves the
+git-correlation half of the pipeline (hooks → trailer → `git_commits.jsonl`
+→ `git_commits` table) end to end. It won't produce a `session_rollups`
+row, though — a plain shell stand-in doesn't emit OTel telemetry the way
+a real Claude Code session does, so there's no `raw_spans`/`raw_events`
+for `ingest.js` to derive one from. Testing that half for real still
+needs the actual `claude` binary.
+
 ## Environment variables
 
 See [`.env.example`](.env.example) for the full list with defaults and
@@ -159,7 +331,7 @@ scripts you run directly and need to be exported in your shell.
 
 | Path | What |
 |---|---|
-| `cli-wrapper/` | `devfinops-claude` — wraps the real Claude Code CLI, tags sessions, ships the git hooks |
+| `cli-wrapper/` | `devfinops-claude` — wraps the real Claude Code CLI, tags sessions, ships the git hooks and the PATH shim (`shim/`, `install-path-shim.sh`) |
 | `collector-config/` | OTel Collector config — receives OTLP, writes `landing_zone/*.jsonl` |
 | `ingestion-service/` | Batch loader: `landing_zone/*.jsonl` → Postgres, plus the active/wait-time derivation |
 | `jira-listener/` | Webhook receiver keeping `jira_issues` in sync (status/summary/points only) |

@@ -93,7 +93,21 @@ CREATE TABLE IF NOT EXISTS session_rollups (
     token_cost_usd    NUMERIC(12,6) NOT NULL DEFAULT 0,
     session_start     TIMESTAMPTZ,
     session_end       TIMESTAMPTZ,
-    computed_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    computed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- 'explicit'    — issue_key came from --issue or the branch-name regex
+    --                 at session time (see cli-wrapper/devfinops-claude.js).
+    --                 This is also the value for UNATTRIBUTED sessions —
+    --                 "explicit" describes how the field was set, not
+    --                 whether it resolved to a real ticket.
+    -- 'ai_confirmed' — a human confirmed a session_attribution_suggestions
+    --                 row and issue_key was promoted from UNATTRIBUTED.
+    --                 db/04_derive_session_rollups.sql's UPSERT preserves
+    --                 this on every subsequent ingest re-run instead of
+    --                 recomputing issue_key back to UNATTRIBUTED — see its
+    --                 own comment before changing that logic.
+    attribution_source TEXT NOT NULL DEFAULT 'explicit'
+        CHECK (attribution_source IN ('explicit', 'ai_confirmed'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_session_rollups_issue_key ON session_rollups (issue_key);
@@ -109,8 +123,46 @@ CREATE TABLE IF NOT EXISTS jira_issues (
     status            TEXT,
     story_points       NUMERIC,
     issue_type        TEXT,
+    assignee_email    TEXT,               -- fields.assignee.emailAddress; null if unassigned or hidden by the workspace's privacy settings
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ---------------------------------------------------------------------
+-- AI-inferred ticket attribution (review queue, not a source of truth).
+--
+-- Populated by a future backend job for sessions that land UNATTRIBUTED
+-- and don't resolve via the single-candidate shortcut (exactly one Jira
+-- ticket in an active status assigned to the developer). Deliberately
+-- separate from session_rollups: a suggestion here NEVER feeds
+-- ticket_rollup / c_total_usd on its own — see the attribution edge-cases
+-- memo on why an unconfirmed guess must never share a column with a
+-- measured number. It only affects cost data once a human reviews it and
+-- session_rollups.issue_key is explicitly promoted (attribution_source
+-- becomes 'ai_confirmed').
+--
+-- signals_used is JSONB, not fixed columns, on purpose: today it holds
+-- privacy-safe signals only (tool commands, file paths, commit
+-- subjects). If prompt-content opt-in ever ships, a richer payload (e.g.
+-- a prompt excerpt) fits in the same column with no migration.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS session_attribution_suggestions (
+    suggestion_id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id           TEXT NOT NULL,
+    suggested_issue_key  TEXT NOT NULL,
+    confidence_score     NUMERIC(4,3),     -- the model's self-reported score — NOT a calibrated probability, see the memo before wiring an auto-accept threshold to it
+    rationale             TEXT,             -- the model's explanation, for a human reviewer — never just the number
+    signals_used          JSONB,
+    model_version         TEXT,
+    status                TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'confirmed', 'rejected')),
+    suggested_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reviewed_by           TEXT,             -- developer_id (hashed) of whoever confirmed/rejected — see the `developers` table, same pseudonymization as everywhere else
+    reviewed_at            TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_attribution_suggestions_session ON session_attribution_suggestions (session_id);
+CREATE INDEX IF NOT EXISTS idx_session_attribution_suggestions_status  ON session_attribution_suggestions (status);
 
 -- ---------------------------------------------------------------------
 -- Developer identity mapping (access-control boundary).

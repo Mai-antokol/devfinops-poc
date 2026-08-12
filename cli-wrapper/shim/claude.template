@@ -1,0 +1,19 @@
+#!/bin/sh
+# devfinops-installed
+#
+# PATH-priority shim for `claude` — installed by
+# cli-wrapper/install-path-shim.sh, not meant to be edited by hand (a
+# re-run of the installer just overwrites it). Lives in a directory
+# ranked earlier in PATH than the real Claude Code binary (see
+# /etc/paths.d/devfinops on macOS), so every invocation of `claude` —
+# typed in a terminal, spawned by an IDE extension, run from CI —
+# resolves here via a plain PATH search, the same way regardless of
+# caller. See the attribution edge-cases memo for why this beats a shell
+# alias, which only an interactive shell that sourced its dotfile ever
+# sees.
+#
+# The path below is substituted at install time with an absolute path,
+# not looked up here — re-resolving `claude` by name at runtime would
+# just find this same shim again.
+
+exec env DEVFINOPS_CLAUDE_BIN="__DEVFINOPS_REAL_CLAUDE_BIN__" node "__DEVFINOPS_WRAPPER_PATH__" "$@"

@@ -95,23 +95,28 @@ async function main() {
   const status = fields.status?.name || null;
   const issueType = fields.issuetype?.name || null;
   const storyPoints = extractStoryPoints(fields, issue.key);
+  // Jira Cloud can hide this per-workspace privacy settings even when an
+  // assignee is set — null here doesn't necessarily mean "unassigned".
+  const assigneeEmail = fields.assignee?.emailAddress || null;
 
   console.log(
-    `[fetch-ticket] ${issue.key}: "${summary}" — status=${status}, type=${issueType}, points=${storyPoints}`
+    `[fetch-ticket] ${issue.key}: "${summary}" — status=${status}, type=${issueType}, ` +
+      `points=${storyPoints}, assignee=${assigneeEmail || '(none / hidden)'}`
   );
 
   const pool = new Pool({ connectionString: DATABASE_URL });
   try {
     await pool.query(
-      `INSERT INTO jira_issues (issue_key, summary, status, story_points, issue_type, updated_at)
-       VALUES ($1, $2, $3, $4, $5, now())
+      `INSERT INTO jira_issues (issue_key, summary, status, story_points, issue_type, assignee_email, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, now())
        ON CONFLICT (issue_key) DO UPDATE SET
-         summary      = EXCLUDED.summary,
-         status       = EXCLUDED.status,
-         story_points = EXCLUDED.story_points,
-         issue_type   = EXCLUDED.issue_type,
-         updated_at   = now()`,
-      [issue.key, summary, status, storyPoints, issueType]
+         summary        = EXCLUDED.summary,
+         status         = EXCLUDED.status,
+         story_points   = EXCLUDED.story_points,
+         issue_type     = EXCLUDED.issue_type,
+         assignee_email = EXCLUDED.assignee_email,
+         updated_at     = now()`,
+      [issue.key, summary, status, storyPoints, issueType, assigneeEmail]
     );
     console.log(`[fetch-ticket] upserted ${issue.key} into jira_issues`);
   } finally {
