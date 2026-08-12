@@ -271,6 +271,69 @@ CREATE TABLE IF NOT EXISTS jira_reconcile_watermark (
 INSERT INTO jira_reconcile_watermark (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 
 -- ---------------------------------------------------------------------
+-- Privacy-safe local-hook signals — see cli-wrapper/claude-hooks/.
+-- Structured metadata derived LOCALLY from prompt/command text before
+-- Claude Code's own telemetry pipeline ever runs, with the raw text
+-- discarded immediately after classification in the hook process itself
+-- — never transmitted, never persisted anywhere, including here. A
+-- narrower, different privacy posture than Claude Code's own
+-- OTEL_LOG_USER_PROMPTS / OTEL_LOG_TOOL_CONTENT flags, which transmit
+-- full raw content once enabled.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS prompt_signals (
+    signal_id       UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id      TEXT,
+    issue_key       TEXT,
+    developer_id    TEXT,               -- pseudonymous, hashed at ingest same as everywhere else
+    intent          TEXT,               -- bug_fix | test | refactor | feature | other
+    mentions_tests  BOOLEAN,
+    prompt_length   INTEGER,
+    ts              TIMESTAMPTZ NOT NULL,
+    ingested_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_prompt_signals_session     ON prompt_signals (session_id);
+CREATE INDEX IF NOT EXISTS idx_prompt_signals_ingested_at ON prompt_signals (ingested_at);
+
+CREATE TABLE IF NOT EXISTS tool_signals (
+    signal_id       UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id      TEXT,
+    issue_key       TEXT,
+    developer_id    TEXT,
+    category        TEXT,               -- test | build | git | other
+    ts              TIMESTAMPTZ NOT NULL,
+    ingested_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_signals_session     ON tool_signals (session_id);
+CREATE INDEX IF NOT EXISTS idx_tool_signals_ingested_at ON tool_signals (ingested_at);
+
+-- ---------------------------------------------------------------------
+-- CI outcomes — the authoritative source for whether tests/builds
+-- actually passed, posted by any CI provider via POST /webhooks/ci on
+-- jira-listener.js (see that file). Deliberately provider-agnostic: a
+-- generic (commit_sha, check_name, status) shape rather than one CI
+-- system's native webhook payload, so this isn't locked to GitHub
+-- Actions vs. GitLab CI vs. Jenkins etc.
+-- ---------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS ci_runs (
+    ci_run_id     UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    commit_sha    TEXT NOT NULL,
+    check_name    TEXT NOT NULL DEFAULT 'default',
+    status        TEXT NOT NULL,        -- success | failure | error | cancelled | pending
+    url           TEXT,
+    started_at    TIMESTAMPTZ,
+    completed_at  TIMESTAMPTZ,
+    ingested_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    UNIQUE (commit_sha, check_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ci_runs_commit_sha ON ci_runs (commit_sha);
+
+-- ---------------------------------------------------------------------
 -- Ingestion cursors — lets ingest.js resume each landing-zone file from
 -- where it left off instead of re-reading from byte zero every run.
 --

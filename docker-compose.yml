@@ -34,6 +34,7 @@ services:
     environment:
       DATABASE_URL: postgres://devfinops:${POSTGRES_PASSWORD:-devfinops}@postgres:5432/devfinops
       JIRA_WEBHOOK_SECRET: ${JIRA_WEBHOOK_SECRET:-changeme}
+      CI_WEBHOOK_SECRET: ${CI_WEBHOOK_SECRET:-changeme}
       PORT: 4000
     ports:
       - "4000:4000"

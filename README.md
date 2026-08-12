@@ -436,6 +436,76 @@ a real Claude Code session does, so there's no `raw_spans`/`raw_events`
 for `ingest.js` to derive one from. Testing that half for real still
 needs the actual `claude` binary.
 
+## Privacy-safe signal derivation (local hooks) & CI integration
+
+Two more signal sources feed the pipeline, both deliberately **not** based on
+logging raw prompt or command text. Claude Code has its own `OTEL_LOG_USER_PROMPTS`
+/ `OTEL_LOG_TOOL_CONTENT` flags for that, and this repo does not enable them —
+see [Testing & Attribution Guide](#testing--attribution-guide) above for why
+`testing_discipline_daily` can't see real Bash command text today. Instead:
+
+### Local hooks: `prompt_signals` / `tool_signals`
+
+`devfinops-claude` wires two Claude Code hooks into every session it launches
+(via `--settings`, automatically — no per-repo install step, unlike the git
+hooks): `cli-wrapper/claude-hooks/user-prompt-submit.js` and
+`cli-wrapper/claude-hooks/post-tool-use-bash.js`.
+
+Each hook sees the real prompt/command text locally, for the few milliseconds
+it takes to run some regexes over it, and **discards it** — only a small
+structured signal is written to `landing_zone/{prompt_signals,tool_signals}.jsonl`:
+
+| Hook | Derives | Never persists |
+|---|---|---|
+| `UserPromptSubmit` | `intent` (`bug_fix`/`feature`/`refactor`/`test`/`other`), `mentions_tests` (bool), `prompt_length` (int) | the prompt text itself |
+| `PostToolUse` (Bash only) | `category` (`test`/`build`/`git`/`other`) | the command text itself |
+
+Both also carry `session_id` / `issue_key` / `developer_email` (from the same
+env vars the wrapper already sets), so `npm run ingest` can load them into
+`prompt_signals` / `tool_signals` and join them to `session_rollups` and
+`git_commits` the same way everything else in this pipeline joins — by
+`session_id`, with `developer_email` hashed into `developer_id` at ingest
+time exactly like every other identity column here.
+
+This is intentionally the smallest useful version: coarse regex classification,
+two tables, no schema redesign. If you need finer-grained categories later,
+extend `INTENT_RULES` / `CATEGORY_RULES` in those two hook files — the raw
+text still never leaves the hook process either way.
+
+### CI webhook: `ci_runs`
+
+Whether tests/builds actually passed or failed is **not** inferred from
+telemetry — Claude Code doesn't reliably emit real command output for that
+(see the Testing & Attribution Guide), and guessing from a coarse `category:
+test` signal would be unreliable anyway. Instead, `jira-listener.js` exposes
+a second, provider-agnostic webhook that your CI system's own
+"on completion" hook can call directly:
+
+```sh
+curl -X POST http://localhost:4000/webhooks/ci \
+  -H "Content-Type: application/json" \
+  -H "x-devfinops-webhook-secret: $CI_WEBHOOK_SECRET" \
+  -d '{
+        "commit_sha": "<the commit sha CI just ran against>",
+        "check_name": "unit-tests",
+        "status": "success",
+        "url": "https://ci.example.com/runs/123"
+      }'
+```
+
+- `commit_sha` and `status` are required; `status` must be one of `success`,
+  `failure`, `error`, `pending`, `cancelled`.
+- `check_name` defaults to `"default"` — give each check a real name (e.g.
+  `unit-tests`, `build`) if your pipeline reports more than one per commit;
+  `(commit_sha, check_name)` is the upsert key, so re-posting the same pair
+  (e.g. pending → success) updates in place rather than duplicating.
+- Auth uses its own `CI_WEBHOOK_SECRET`, separate from `JIRA_WEBHOOK_SECRET`
+  — a CI system is a different trust boundary than Jira.
+
+Rows land in `ci_runs` (`commit_sha`, `check_name`, `status`, `url`,
+`started_at`, `completed_at`), joinable to `git_commits.commit_sha` and, from
+there, back to the session and ticket that produced the commit.
+
 ## Environment variables
 
 See [`.env.example`](.env.example) for the full list with defaults and
@@ -445,6 +515,7 @@ explanations. Summary:
 |---|---|---|
 | `POSTGRES_PASSWORD` | docker compose | `devfinops` |
 | `JIRA_WEBHOOK_SECRET` | docker compose (jira-listener) | `changeme` |
+| `CI_WEBHOOK_SECRET` | docker compose (jira-listener) | `changeme` |
 | `GF_SECURITY_ADMIN_PASSWORD` | docker compose (grafana) | `devfinops` |
 | `DATABASE_URL` | `ingestion-service/ingest.js` | `postgres://devfinops:devfinops@localhost:5432/devfinops` |
 | `LANDING_ZONE_DIR` | `ingestion-service/ingest.js` | `./landing_zone` |
@@ -462,7 +533,7 @@ scripts you run directly and need to be exported in your shell.
 
 | Path | What |
 |---|---|
-| `cli-wrapper/` | `devfinops-claude` — wraps the real Claude Code CLI, tags sessions, ships the git hooks and the PATH shim (`shim/`, `install-path-shim.sh`) |
+| `cli-wrapper/` | `devfinops-claude` — wraps the real Claude Code CLI, tags sessions, ships the git hooks, the PATH shim (`shim/`, `install-path-shim.sh`), and the privacy-safe local hooks (`claude-hooks/`) |
 | `collector-config/` | OTel Collector config — receives OTLP, writes `landing_zone/*.jsonl` |
 | `ingestion-service/` | Batch loader: `landing_zone/*.jsonl` → Postgres, plus the active/wait-time derivation |
 | `jira-listener/` | Webhook receiver keeping `jira_issues` in sync (status/summary/points only) |
@@ -482,3 +553,12 @@ scripts you run directly and need to be exported in your shell.
   empty until real sessions are ingested.
 - Passwords in `.env.example` are placeholders, not secrets — see the
   file's own comments before this touches anything beyond a laptop.
+- The local hooks (`prompt_signals`/`tool_signals`) classify with a handful
+  of regexes, not a model — expect `other` to be common and category
+  boundaries to be rough. They're deliberately not trying to be precise,
+  only privacy-safe; see [Privacy-safe signal derivation](#privacy-safe-signal-derivation-local-hooks--ci-integration).
+- Nothing calls `/webhooks/ci` for you — you need to point your CI
+  provider's own webhook config at it. There's no built-in adapter for any
+  specific CI provider's native payload shape (GitHub Actions, CircleCI,
+  etc.) in this POC, only the generic `{commit_sha, check_name, status,
+  ...}` contract described above.

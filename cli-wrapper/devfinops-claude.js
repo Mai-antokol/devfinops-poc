@@ -158,6 +158,37 @@ function buildEnv(issueKey, developer, sessionId) {
   };
 }
 
+// ---- Claude Code hooks (privacy-safe signal derivation) -----------------
+//
+// Wires up cli-wrapper/claude-hooks/*.js so every session launched through
+// this wrapper gets them automatically — no per-repo install step, unlike
+// the git hooks. Passed to `claude` as an inline JSON string via
+// --settings, which the CLI docs describe as accepting "a settings JSON
+// file OR a JSON string" — confirmed empirically (not assumed) that the
+// inline-string form works and that --settings requires the hooks payload
+// wrapped under a "hooks" key, which contradicted what the locally
+// installed plugin-dev hook docs claimed for plain settings.json files.
+//
+// Known limitation for this first pass: if the developer's own command
+// line also passes --settings, both flags end up in argv and it's not
+// verified here which one wins. Not handling that yet — keep this small.
+function buildHooksSettingsJson() {
+  const hooksDir = path.resolve(__dirname, 'claude-hooks');
+  const userPromptSubmit = path.join(hooksDir, 'user-prompt-submit.js');
+  const postToolUseBash = path.join(hooksDir, 'post-tool-use-bash.js');
+
+  return JSON.stringify({
+    hooks: {
+      UserPromptSubmit: [
+        { matcher: '*', hooks: [{ type: 'command', command: `node ${JSON.stringify(userPromptSubmit)}` }] },
+      ],
+      PostToolUse: [
+        { matcher: 'Bash', hooks: [{ type: 'command', command: `node ${JSON.stringify(postToolUseBash)}` }] },
+      ],
+    },
+  });
+}
+
 // ---- Main ----------------------------------------------------------------
 
 function main() {
@@ -197,8 +228,9 @@ function main() {
   process.stderr.write(`[devfinops-claude] session id: ${sessionId}\n`);
 
   const env = buildEnv(issueKey, developer, sessionId);
+  const spawnArgs = [...forwardedArgs, '--settings', buildHooksSettingsJson()];
 
-  const child = spawn(CONFIG.realBinary, forwardedArgs, {
+  const child = spawn(CONFIG.realBinary, spawnArgs, {
     stdio: 'inherit',
     env,
   });

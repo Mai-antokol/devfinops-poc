@@ -529,6 +529,127 @@ async function ingestGitCommits(filePath, client) {
   return { commits: commitCount };
 }
 
+// ---- Privacy-safe local-hook signals ---------------------------------------
+//
+// prompt_signals.jsonl / tool_signals.jsonl are written by
+// cli-wrapper/claude-hooks/*.js — already-derived structured signal, no
+// raw prompt or command text ever in these files (see that directory's
+// own comments for why). developer_email here is the plain value the
+// hook read from DEVFINOPS_DEVELOPER_ID; hashed the same way as every
+// other developer_id column before it lands in a table.
+
+async function ingestPromptSignals(filePath, client) {
+  const fileName = path.resolve(filePath);
+  if (!fs.existsSync(filePath)) {
+    console.warn(`[ingest] no prompt_signals file at ${filePath}, skipping`);
+    return { signals: 0 };
+  }
+
+  const cursor = await getCursor(client, fileName);
+  const { lines, newOffset, inode } = await readNewLines(filePath, cursor);
+  if (lines.length === 0) {
+    if (cursor.inode !== inode) await upsertCursor(client, fileName, inode, newOffset);
+    return { signals: 0 };
+  }
+
+  let signalCount = 0;
+  await client.query('BEGIN');
+  try {
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch (e) {
+        console.warn(`[ingest] skipping malformed prompt_signals line: ${e.message}`);
+        continue;
+      }
+
+      const rawDeveloperId = record.developer_email || 'UNATTRIBUTED';
+      await upsertDeveloper(client, rawDeveloperId, record.developer_email);
+
+      await client.query(
+        `INSERT INTO prompt_signals (
+           session_id, issue_key, developer_id, intent, mentions_tests,
+           prompt_length, ts
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [
+          record.session_id || null,
+          record.issue_key || null,
+          hashDeveloperId(rawDeveloperId),
+          record.intent || null,
+          record.mentions_tests === true,
+          Number(record.prompt_length || 0),
+          record.ts || null,
+        ]
+      );
+      signalCount += 1;
+    }
+
+    await upsertCursor(client, fileName, inode, newOffset);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  }
+
+  return { signals: signalCount };
+}
+
+async function ingestToolSignals(filePath, client) {
+  const fileName = path.resolve(filePath);
+  if (!fs.existsSync(filePath)) {
+    console.warn(`[ingest] no tool_signals file at ${filePath}, skipping`);
+    return { signals: 0 };
+  }
+
+  const cursor = await getCursor(client, fileName);
+  const { lines, newOffset, inode } = await readNewLines(filePath, cursor);
+  if (lines.length === 0) {
+    if (cursor.inode !== inode) await upsertCursor(client, fileName, inode, newOffset);
+    return { signals: 0 };
+  }
+
+  let signalCount = 0;
+  await client.query('BEGIN');
+  try {
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch (e) {
+        console.warn(`[ingest] skipping malformed tool_signals line: ${e.message}`);
+        continue;
+      }
+
+      const rawDeveloperId = record.developer_email || 'UNATTRIBUTED';
+      await upsertDeveloper(client, rawDeveloperId, record.developer_email);
+
+      await client.query(
+        `INSERT INTO tool_signals (session_id, issue_key, developer_id, category, ts)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [
+          record.session_id || null,
+          record.issue_key || null,
+          hashDeveloperId(rawDeveloperId),
+          record.category || null,
+          record.ts || null,
+        ]
+      );
+      signalCount += 1;
+    }
+
+    await upsertCursor(client, fileName, inode, newOffset);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  }
+
+  return { signals: signalCount };
+}
+
 // ---- Jira reconciliation ---------------------------------------------------
 //
 // Sessions and commits can reference an issue_key that jira_issues has
@@ -694,6 +815,12 @@ async function main() {
 
     const commitsResult = await ingestGitCommits(path.join(LANDING_ZONE_DIR, 'git_commits.jsonl'), client);
     console.log(`[ingest] loaded ${commitsResult.commits} git commits`);
+
+    const promptSignalsResult = await ingestPromptSignals(path.join(LANDING_ZONE_DIR, 'prompt_signals.jsonl'), client);
+    console.log(`[ingest] loaded ${promptSignalsResult.signals} prompt signals`);
+
+    const toolSignalsResult = await ingestToolSignals(path.join(LANDING_ZONE_DIR, 'tool_signals.jsonl'), client);
+    console.log(`[ingest] loaded ${toolSignalsResult.signals} tool signals`);
 
     const jiraResult = await reconcileMissingJiraIssues(client);
     if (jiraResult.fetched > 0 || jiraResult.failed > 0) {
