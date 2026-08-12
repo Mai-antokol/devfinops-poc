@@ -42,6 +42,10 @@ GRANT USAGE ON SCHEMA public TO grafana_reader;
 -- the views themselves, not on the tables underneath them (jira_issues,
 -- rate_config, raw_events, etc.) — except session_rollups, which two of
 -- the shipped panels JOIN against directly in their own SQL.
+-- prompt_intent_daily / tool_category_daily are granted the same
+-- view-only way — grafana_reader still never sees raw prompt_signals /
+-- tool_signals rows (session-level developer_id + timestamps), only the
+-- daily aggregate.
 GRANT SELECT ON
     ticket_rollup,
     session_rollups,
@@ -49,5 +53,7 @@ GRANT SELECT ON
     prompt_thrash_by_session,
     subagent_fanout_by_session,
     guardrail_blocks_daily,
+    prompt_intent_daily,
+    tool_category_daily,
     git_commits
 TO grafana_reader;

@@ -2,7 +2,7 @@
   "title": "DevFinOps — AI Capability & Engineering Health",
   "uid": "devfinops-main",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "editable": true,
   "timezone": "browser",
   "time": { "from": "now-30d", "to": "now" },
@@ -303,6 +303,104 @@
               "refId": "A",
               "format": "time_series",
               "rawSql": "SELECT day AS time, reason, block_count FROM guardrail_blocks_daily WHERE day BETWEEN $__timeFrom() AND $__timeTo() ORDER BY day;"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "row",
+      "title": "Prompt & tool signals (local hooks) — fills in with more usage",
+      "description": "Derived from the privacy-safe UserPromptSubmit/PostToolUse local hooks — coarse regex classification of intent and Bash command category, raw prompt/command text never stored. See README: Privacy-safe signal derivation.",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 13,
+          "type": "timeseries",
+          "title": "Prompt intent breakdown",
+          "description": "Prompts submitted per day, by derived intent (bug_fix/feature/refactor/test/other). Regex-classified, not a model — expect \"other\" to be common.",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+          "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "custom": { "lineWidth": 2, "fillOpacity": 15, "drawStyle": "line", "spanNulls": false }
+            },
+            "overrides": [
+              { "matcher": { "id": "byName", "options": "bug_fix" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#199e70" } }] },
+              { "matcher": { "id": "byName", "options": "feature" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#c98500" } }] },
+              { "matcher": { "id": "byName", "options": "refactor" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#d55181" } }] },
+              { "matcher": { "id": "byName", "options": "test" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#008300" } }] },
+              { "matcher": { "id": "byName", "options": "other" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#9085e9" } }] }
+            ]
+          },
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" } },
+          "targets": [
+            {
+              "refId": "A",
+              "format": "time_series",
+              "rawSql": "SELECT day AS time, intent, prompt_count FROM prompt_intent_daily WHERE day BETWEEN $__timeFrom() AND $__timeTo() ORDER BY day;"
+            }
+          ]
+        },
+        {
+          "id": 14,
+          "type": "timeseries",
+          "title": "Bash tool-call category breakdown",
+          "description": "Bash tool calls per day, by derived category (test/build/git/other). Command text is classified locally by the hook and discarded, never persisted.",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+          "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "custom": { "lineWidth": 2, "fillOpacity": 15, "drawStyle": "line", "spanNulls": false }
+            },
+            "overrides": [
+              { "matcher": { "id": "byName", "options": "test" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#199e70" } }] },
+              { "matcher": { "id": "byName", "options": "build" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#c98500" } }] },
+              { "matcher": { "id": "byName", "options": "git" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#d55181" } }] },
+              { "matcher": { "id": "byName", "options": "other" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#008300" } }] }
+            ]
+          },
+          "options": { "legend": { "showLegend": true, "displayMode": "list", "placement": "bottom" } },
+          "targets": [
+            {
+              "refId": "A",
+              "format": "time_series",
+              "rawSql": "SELECT day AS time, category, tool_call_count FROM tool_category_daily WHERE day BETWEEN $__timeFrom() AND $__timeTo() ORDER BY day;"
+            }
+          ]
+        },
+        {
+          "id": 15,
+          "type": "stat",
+          "title": "Prompts mentioning tests",
+          "description": "Share of submitted prompts whose text mentioned test/tests/testing/spec/coverage — a structural proxy for testing intent, not a judgment.",
+          "gridPos": { "h": 4, "w": 24, "x": 0, "y": 31 },
+          "datasource": { "type": "postgres", "uid": "devfinops-postgres" },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "decimals": 1,
+              "color": { "mode": "fixed", "fixedColor": "#3987e5" }
+            }
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "colorMode": "value",
+            "graphMode": "none",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "format": "table",
+              "rawSql": "SELECT ROUND(100.0 * SUM(mentions_tests_count) / NULLIF(SUM(prompt_count), 0), 1) AS mentions_tests_pct FROM prompt_intent_daily WHERE day BETWEEN $__timeFrom() AND $__timeTo();"
             }
           ]
         }

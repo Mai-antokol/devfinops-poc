@@ -95,3 +95,33 @@ SELECT
 FROM guardrail_blocks
 GROUP BY 1, 2
 ORDER BY 1;
+
+-- Prompt intent breakdown, from the privacy-safe UserPromptSubmit local
+-- hook (see cli-wrapper/claude-hooks/user-prompt-submit.js) — coarse
+-- regex classification, not a model. mentions_tests_pct is exposed here
+-- rather than as its own view since it's a cheap derived column on the
+-- same grouping, not a separate concern.
+CREATE OR REPLACE VIEW prompt_intent_daily AS
+SELECT
+    date_trunc('day', ts) AS day,
+    intent,
+    COUNT(*) AS prompt_count,
+    COUNT(*) FILTER (WHERE mentions_tests) AS mentions_tests_count,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE mentions_tests) / NULLIF(COUNT(*), 0),
+        1
+    ) AS mentions_tests_pct
+FROM prompt_signals
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+-- Bash tool-call category breakdown, from the privacy-safe PostToolUse
+-- local hook (see cli-wrapper/claude-hooks/post-tool-use-bash.js).
+CREATE OR REPLACE VIEW tool_category_daily AS
+SELECT
+    date_trunc('day', ts) AS day,
+    category,
+    COUNT(*) AS tool_call_count
+FROM tool_signals
+GROUP BY 1, 2
+ORDER BY 1, 2;
