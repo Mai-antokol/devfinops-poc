@@ -30,6 +30,11 @@ const readline = require('readline');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 
+// Resolved relative to the repo root regardless of which directory this
+// is run from, same reasoning as LANDING_ZONE_DIR below — see
+// jira-listener/fetch-ticket.js for the identical pattern.
+require('dotenv').config({ path: path.resolve(__dirname, '..', '.env') });
+
 // Resolved relative to this file, not the current working directory —
 // `npm run ingest` is normally invoked from inside ingestion-service/,
 // where a `./landing_zone` default would silently point at a directory
@@ -37,6 +42,15 @@ const { Pool } = require('pg');
 // Collector actually writes to (same fix as cli-wrapper's landingZoneDir).
 const LANDING_ZONE_DIR = process.env.LANDING_ZONE_DIR || path.resolve(__dirname, '..', 'landing_zone');
 const DATABASE_URL = process.env.DATABASE_URL || 'postgres://devfinops:devfinops@localhost:5432/devfinops';
+
+// Auto-fetch config for reconcileMissingJiraIssues() below — same
+// credentials as jira-listener/fetch-ticket.js, read from the same .env.
+// Auto-fetching is skipped entirely (with a warning, not an error) when
+// these aren't set, so ingest.js keeps working without Jira configured.
+const JIRA_HOST = process.env.JIRA_HOST;
+const JIRA_USER_EMAIL = process.env.JIRA_USER_EMAIL;
+const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
+const JIRA_STORY_POINTS_FIELD = process.env.JIRA_STORY_POINTS_FIELD || 'customfield_10016';
 // Pepper for the developer_id hash — override in any real deployment.
 // This is a POC-appropriate simplification (see docker-compose.yml's
 // POSTGRES_PASSWORD / JIRA_WEBHOOK_SECRET for the same pattern), not
@@ -368,6 +382,114 @@ async function ingestGitCommits(filePath, client) {
   return { commits: commitCount };
 }
 
+// ---- Jira reconciliation ---------------------------------------------------
+//
+// Sessions and commits can reference an issue_key that jira_issues has
+// never seen (jira-listener.js only hears about a ticket if a webhook
+// fires for it; fetch-ticket.js only knows about keys someone fetched by
+// hand). Rather than requiring a manual fetch-ticket.js run for every
+// new key, pull the missing ones automatically here, once per ingest
+// run — same REST API v3 call and field extraction as fetch-ticket.js,
+// duplicated rather than shared, matching how this repo doesn't share
+// code across service directories anywhere else either.
+
+function extractStoryPoints(fields, issueKey) {
+  const raw = fields[JIRA_STORY_POINTS_FIELD];
+  if (typeof raw === 'number') return raw;
+  if (raw != null) {
+    console.warn(
+      `[ingest] ${JIRA_STORY_POINTS_FIELD} on ${issueKey} isn't numeric (${JSON.stringify(raw)}) — ` +
+        `storing null. Set JIRA_STORY_POINTS_FIELD if your instance uses a different custom field id.`
+    );
+  }
+  return null;
+}
+
+async function fetchJiraIssue(issueKey) {
+  const url = `${JIRA_HOST.replace(/\/$/, '')}/rest/api/3/issue/${encodeURIComponent(issueKey)}`;
+  const auth = Buffer.from(`${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}`).toString('base64');
+
+  const res = await fetch(url, {
+    headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' },
+  });
+
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(`Jira rejected the credentials (HTTP ${res.status}) — check JIRA_USER_EMAIL / JIRA_API_TOKEN in .env`);
+  }
+  if (res.status === 404) {
+    throw new Error(`not found at ${JIRA_HOST} (HTTP 404) — is ${issueKey} a real key on this workspace?`);
+  }
+  if (!res.ok) {
+    throw new Error(`Jira API request failed: HTTP ${res.status} ${res.statusText}`);
+  }
+  return res.json();
+}
+
+async function reconcileMissingJiraIssues(client) {
+  // Issue keys with a real session, event, or commit but no jira_issues
+  // row yet — not scoped to just this run's landing-zone files, so this
+  // also backfills any gap left over from before auto-fetch existed.
+  const { rows } = await client.query(`
+    SELECT DISTINCT seen.issue_key
+    FROM (
+      SELECT issue_key FROM raw_spans   WHERE issue_key IS NOT NULL AND issue_key <> 'UNATTRIBUTED'
+      UNION
+      SELECT issue_key FROM raw_events  WHERE issue_key IS NOT NULL AND issue_key <> 'UNATTRIBUTED'
+      UNION
+      SELECT issue_key FROM git_commits WHERE issue_key IS NOT NULL AND issue_key <> 'UNATTRIBUTED'
+    ) seen
+    WHERE NOT EXISTS (SELECT 1 FROM jira_issues ji WHERE ji.issue_key = seen.issue_key)
+  `);
+
+  if (rows.length === 0) return { fetched: 0, failed: 0 };
+
+  if (!JIRA_HOST || !JIRA_USER_EMAIL || !JIRA_API_TOKEN) {
+    console.warn(
+      `[ingest] ${rows.length} issue key(s) have no jira_issues row yet ` +
+        `(${rows.map((r) => r.issue_key).join(', ')}) — JIRA_HOST/JIRA_USER_EMAIL/JIRA_API_TOKEN ` +
+        `aren't set in .env, skipping automatic fetch. See README's Jira setup guide.`
+    );
+    return { fetched: 0, failed: 0 };
+  }
+
+  let fetched = 0;
+  let failed = 0;
+  for (const { issue_key: issueKey } of rows) {
+    try {
+      const issue = await fetchJiraIssue(issueKey);
+      const fields = issue.fields || {};
+      await client.query(
+        `INSERT INTO jira_issues (issue_key, summary, status, story_points, issue_type, assignee_email, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6, now())
+         ON CONFLICT (issue_key) DO UPDATE SET
+           summary        = EXCLUDED.summary,
+           status         = EXCLUDED.status,
+           story_points   = EXCLUDED.story_points,
+           issue_type     = EXCLUDED.issue_type,
+           assignee_email = EXCLUDED.assignee_email,
+           updated_at     = now()`,
+        [
+          issue.key,
+          fields.summary || null,
+          fields.status?.name || null,
+          extractStoryPoints(fields, issue.key),
+          fields.issuetype?.name || null,
+          fields.assignee?.emailAddress || null,
+        ]
+      );
+      console.log(`[ingest] auto-fetched ${issue.key} from Jira and upserted into jira_issues`);
+      fetched += 1;
+    } catch (err) {
+      // One bad key (typo'd branch name, deleted ticket, ...) shouldn't
+      // abort ingestion for everything else — log and move on.
+      console.warn(`[ingest] could not auto-fetch ${issueKey} from Jira (continuing): ${err.message}`);
+      failed += 1;
+    }
+  }
+
+  return { fetched, failed };
+}
+
 // ---- Main -----------------------------------------------------------------
 
 async function main() {
@@ -383,6 +505,11 @@ async function main() {
 
     const commitsResult = await ingestGitCommits(path.join(LANDING_ZONE_DIR, 'git_commits.jsonl'), client);
     console.log(`[ingest] loaded ${commitsResult.commits} git commits`);
+
+    const jiraResult = await reconcileMissingJiraIssues(client);
+    if (jiraResult.fetched > 0 || jiraResult.failed > 0) {
+      console.log(`[ingest] Jira reconciliation: ${jiraResult.fetched} fetched, ${jiraResult.failed} failed`);
+    }
 
     console.log('[ingest] running derivation query (session_rollups)...');
     const sql = fs.readFileSync(path.join(__dirname, '..', 'db', '04_derive_session_rollups.sql'), 'utf8');

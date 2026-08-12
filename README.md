@@ -155,6 +155,94 @@ ticket-economics panel until a session (real or via `ingest.js`) exists
 for the same issue key, since that panel is driven by `session_rollups`
 with Jira data joined in for context, not the other way around.
 
+**You shouldn't need to run this by hand for routine use anymore.**
+With the same `.env` credentials in place, `ingest.js` now does this
+automatically: every time it runs, it checks for any `issue_key` that
+shows up in a session or commit but has no `jira_issues` row yet, and
+fetches it — no manual `fetch-ticket.js` invocation required. See
+"Automatic Jira ticket fetching" below. `fetch-ticket.js` is still
+useful for pulling a specific ticket on demand, ahead of any session
+existing for it.
+
+## Connecting a Real Jira Workspace
+
+Two different setups, for two different stages — don't reach for the
+second one just because it sounds more "real."
+
+### Dev / pilot (what's implemented in this repo today)
+
+1. Generate an API token at
+   [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens).
+2. `cp .env.example .env` and fill in `JIRA_HOST`, `JIRA_USER_EMAIL`,
+   `JIRA_API_TOKEN`.
+3. That's the whole setup. From here, ticket metadata takes care of
+   itself — see the next section.
+
+**Automatic Jira ticket fetching.** Every `npm run ingest` now checks
+Postgres for any `issue_key` referenced by a session or a git commit
+that doesn't have a `jira_issues` row yet, and fetches it from the real
+Jira REST API v3 on the spot — same call `fetch-ticket.js` makes, same
+upsert. One bad key (a typo'd branch name, a deleted ticket) logs a
+warning and doesn't stop the rest of ingestion. No credentials set? It
+logs which keys are waiting and skips the fetch — ingestion still
+completes normally, it just won't have Jira context for those tickets
+yet.
+
+```sh
+cd ingestion-service
+npm run ingest
+# [ingest] auto-fetched SAM1-11 from Jira and upserted into jira_issues
+```
+
+**Testing the webhook path too** (optional — auto-fetch above already
+covers "does this ticket exist in our DB"; the webhook keeps
+`summary`/`status`/`story_points` fresh as a ticket changes, without
+waiting for the next session). Two things you need that a personal dev
+setup doesn't have by default:
+
+- **A publicly reachable URL** — Jira Cloud can't reach `localhost:4000`
+  directly. Point a tunnel (`ngrok http 4000`, or `cloudflared`) at it
+  and use the public URL it gives you.
+- **Something in Jira that sends the request.** The admin-only
+  *System → Webhooks* screen exists, but doesn't make it easy to attach
+  a custom header, which `jira-listener.js` requires
+  (`x-devfinops-webhook-secret`). For a dev/pilot workspace, a
+  **Jira Automation rule** is the more accessible path: *Project
+  Settings → Automation → Create rule* → trigger on *Issue Created* /
+  *Issue Updated* → action *Send web request*, pointed at
+  `<your-tunnel-url>/webhooks/jira`, with a custom header
+  `x-devfinops-webhook-secret: <your JIRA_WEBHOOK_SECRET>`.
+
+### Enterprise production rollout (architecture guidance — not built in this POC)
+
+This is a genuinely different system, not a config change on top of the
+dev setup — flagging that plainly rather than implying it's a small
+step up:
+
+1. **Register an OAuth 2.0 (3LO) app** at
+   [developer.atlassian.com/console/myapps](https://developer.atlassian.com/console/myapps/),
+   with `read:jira-work` and `read:jira-user` scopes.
+2. **Org admin does a one-time consent install** — this grants org-wide
+   access through a single app identity, not a personal API token per
+   developer. Same org-level-over-per-user principle as the two-tier
+   deployment memo's Tier 0 recommendation.
+3. **Store the resulting access + refresh tokens in a real secret
+   store**, not `.env` — this needs actual multi-tenant infrastructure
+   behind it (see that same memo's callout that "5 minutes to connect"
+   is a true claim about the OAuth consent screen, not about the backend
+   it has to land in, which doesn't exist yet in this repo).
+4. **Handle token refresh.** Atlassian 3LO access tokens expire in about
+   an hour — the integration needs to use the refresh token to get a new
+   one automatically, or ingestion silently starts failing auth partway
+   through the day.
+5. **Register webhooks programmatically**, via `POST /rest/api/3/webhook`
+   using the OAuth access token, rather than a human clicking through a
+   UI per workspace — scoped to `jira:issue_created` /
+   `jira:issue_updated`, pointed at a production `jira-listener` sitting
+   behind real TLS with real request verification (Atlassian's webhook
+   signing, or requiring the OAuth-authenticated caller) — not the
+   shared-secret header this POC uses today.
+
 ## Testing & Attribution Guide
 
 How a session ends up tied (or not tied) to a Jira ticket, end to end.
@@ -320,8 +408,8 @@ explanations. Summary:
 | `DEVFINOPS_ID_SALT` | `ingestion-service/ingest.js` | placeholder — change before real use |
 | `DEVFINOPS_CLAUDE_BIN` | `cli-wrapper/devfinops-claude.js` | `claude` |
 | `DEVFINOPS_OTLP_ENDPOINT` | `cli-wrapper/devfinops-claude.js` | `http://localhost:4317` |
-| `JIRA_HOST`, `JIRA_USER_EMAIL`, `JIRA_API_TOKEN` | `jira-listener/fetch-ticket.js` | none — required, no default |
-| `JIRA_STORY_POINTS_FIELD` | `jira-listener/fetch-ticket.js`, `jira-listener.js` | `customfield_10016` |
+| `JIRA_HOST`, `JIRA_USER_EMAIL`, `JIRA_API_TOKEN` | `fetch-ticket.js`, `ingest.js` (auto-fetch) | none — auto-fetch skips (with a warning) if unset |
+| `JIRA_STORY_POINTS_FIELD` | `jira-listener.js`, `fetch-ticket.js`, `ingest.js` | `customfield_10016` |
 
 Only the first three are read automatically by `docker compose` (from a
 `.env` file in the repo root, if present); the rest are for the Node
