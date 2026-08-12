@@ -658,16 +658,46 @@ async function main() {
       console.log(`[ingest] Jira reconciliation: ${jiraResult.fetched} fetched, ${jiraResult.failed} failed`);
     }
 
-    console.log('[ingest] running derivation query (session_rollups)...');
+    // Captured before the derive query runs, not after — if anything
+    // gets ingested_at stamped between "we read the watermark" and "we
+    // finish deriving," we want the NEXT run to still pick it up rather
+    // than have this run's success silently advance the watermark past
+    // it.
+    const runStartedAt = new Date();
+    const { rows: watermarkRows } = await client.query(
+      'SELECT last_derived_at FROM derive_watermark WHERE id = 1'
+    );
+    const watermarkRaw = watermarkRows[0]?.last_derived_at;
+    // node-postgres parses the timestamptz special values -infinity/
+    // infinity as the JS primitives -Infinity/Infinity (numbers, the
+    // only case this column ever comes back as a number instead of a
+    // Date) — a Date can't represent them, so .toISOString() throws.
+    // Not a rare edge case here: -infinity is the bootstrap default, so
+    // this fires on literally the first real run, before anything has
+    // ever been derived.
+    const watermarkLiteral =
+      typeof watermarkRaw === 'number'
+        ? (watermarkRaw > 0 ? 'infinity' : '-infinity')
+        : (watermarkRaw ?? new Date(0)).toISOString();
+    console.log(`[ingest] running derivation query (sessions touched since ${watermarkLiteral})...`);
     const sql = fs.readFileSync(path.join(__dirname, '..', 'db', '04_derive_session_rollups.sql'), 'utf8');
     // Strip psql \set meta-commands and substitute the values inline, since
     // the pg driver (unlike psql) can't interpret \set. Keep this in sync
     // with the defaults in db/derive_session_rollups.sql if you change them.
+    // \S+ (not \d+) because derive_watermark's default is "-infinity", not
+    // a number, unlike floor/ceiling.
     const executable = sql
-      .replace(/\\set\s+\w+\s+\d+/g, '')
+      .replace(/\\set\s+\w+\s+\S+/g, '')
       .replace(/:ceiling_seconds/g, '900')
-      .replace(/:floor_seconds/g, '60');
-    await client.query(executable);
+      .replace(/:floor_seconds/g, '60')
+      .replace(/:'derive_watermark'/g, `'${watermarkLiteral}'`);
+    const deriveResult = await client.query(executable);
+    console.log(`[ingest] recomputed ${deriveResult.rowCount} session rollup(s)`);
+
+    await client.query(
+      'UPDATE derive_watermark SET last_derived_at = $1 WHERE id = 1',
+      [runStartedAt]
+    );
 
     console.log('[ingest] done.');
   } finally {

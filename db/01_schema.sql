@@ -40,10 +40,14 @@ CREATE TABLE IF NOT EXISTS raw_spans (
     ingested_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_raw_spans_session   ON raw_spans (session_id);
-CREATE INDEX IF NOT EXISTS idx_raw_spans_issue_key ON raw_spans (issue_key);
-CREATE INDEX IF NOT EXISTS idx_raw_spans_developer ON raw_spans (developer_id);
-CREATE INDEX IF NOT EXISTS idx_raw_spans_kind       ON raw_spans (span_kind);
+CREATE INDEX IF NOT EXISTS idx_raw_spans_session     ON raw_spans (session_id);
+CREATE INDEX IF NOT EXISTS idx_raw_spans_issue_key   ON raw_spans (issue_key);
+CREATE INDEX IF NOT EXISTS idx_raw_spans_developer   ON raw_spans (developer_id);
+CREATE INDEX IF NOT EXISTS idx_raw_spans_kind        ON raw_spans (span_kind);
+-- Lets db/04_derive_session_rollups.sql's touched_sessions CTE find
+-- "what changed since the last derive run" as a cheap index range scan
+-- instead of a full-table scan.
+CREATE INDEX IF NOT EXISTS idx_raw_spans_ingested_at ON raw_spans (ingested_at);
 
 CREATE TABLE IF NOT EXISTS raw_events (
     event_id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -74,11 +78,12 @@ CREATE TABLE IF NOT EXISTS raw_events (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_events_dedup
     ON raw_events (session_id, event_name, ts, (COALESCE(tool_name, '')));
 
-CREATE INDEX IF NOT EXISTS idx_raw_events_session   ON raw_events (session_id);
-CREATE INDEX IF NOT EXISTS idx_raw_events_issue_key ON raw_events (issue_key);
-CREATE INDEX IF NOT EXISTS idx_raw_events_developer ON raw_events (developer_id);
-CREATE INDEX IF NOT EXISTS idx_raw_events_name      ON raw_events (event_name);
-CREATE INDEX IF NOT EXISTS idx_raw_events_ts         ON raw_events (ts);
+CREATE INDEX IF NOT EXISTS idx_raw_events_session     ON raw_events (session_id);
+CREATE INDEX IF NOT EXISTS idx_raw_events_issue_key   ON raw_events (issue_key);
+CREATE INDEX IF NOT EXISTS idx_raw_events_developer   ON raw_events (developer_id);
+CREATE INDEX IF NOT EXISTS idx_raw_events_name        ON raw_events (event_name);
+CREATE INDEX IF NOT EXISTS idx_raw_events_ts          ON raw_events (ts);
+CREATE INDEX IF NOT EXISTS idx_raw_events_ingested_at ON raw_events (ingested_at);
 
 -- ---------------------------------------------------------------------
 -- Derived rollups (populated by db/derive_session_rollups.sql)
@@ -112,6 +117,20 @@ CREATE TABLE IF NOT EXISTS session_rollups (
 
 CREATE INDEX IF NOT EXISTS idx_session_rollups_issue_key ON session_rollups (issue_key);
 CREATE INDEX IF NOT EXISTS idx_session_rollups_developer ON session_rollups (developer_id);
+
+-- Single-row watermark so db/04_derive_session_rollups.sql only
+-- recomputes sessions with data ingested since the last successful run,
+-- instead of re-aggregating all of raw_spans/raw_events every time.
+-- '-infinity' as the bootstrap default means the very first run (or a
+-- fresh container) does a full recompute, same as before this existed.
+-- Only advanced by ingest.js after the derive query actually succeeds —
+-- if it fails partway, the next run's scope naturally still includes
+-- whatever was missed, rather than silently skipping it forever.
+CREATE TABLE IF NOT EXISTS derive_watermark (
+    id              INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    last_derived_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity'
+);
+INSERT INTO derive_watermark (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 
 -- ---------------------------------------------------------------------
 -- Jira context (Step 3) — status/summary only, no worklogs

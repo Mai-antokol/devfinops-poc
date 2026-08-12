@@ -1,8 +1,12 @@
 -- derive_session_rollups.sql
 --
 -- Computes T_wait and T_active per session and upserts into session_rollups.
--- Safe to re-run repeatedly (e.g. on a cron/schedule) — it's a full
--- recompute per session, not an incremental append.
+-- Incremental, not a full recompute: only sessions with a raw_spans/
+-- raw_events row ingested since :derive_watermark get recomputed — see
+-- the touched_sessions CTE below and the derive_watermark table comment
+-- in db/01_schema.sql. Still safe to re-run repeatedly; a session with
+-- nothing new since the watermark is just skipped, its existing rollup
+-- already being correct and unchanged.
 --
 -- T_wait  = sum of tool-execution + llm_request span durations
 --           (time Claude/subagents spent actually running)
@@ -21,8 +25,26 @@
 
 \set floor_seconds 60
 \set ceiling_seconds 900   -- 15 minutes
+\set derive_watermark -infinity
 
-WITH wait_time AS (
+WITH touched_sessions AS (
+    -- Whole sessions, not individual rows: a session with even one row
+    -- ingested since the watermark gets fully rescoped below and its
+    -- COMPLETE history re-aggregated, not just the new rows. That's
+    -- required, not just simpler — turn_boundaries' LAG() window
+    -- function needs a session's full, in-order event history to
+    -- compute a correct "gap since the previous event"; filtering
+    -- individual rows by ingested_at would silently corrupt that
+    -- computation for any session whose earlier events were ingested in
+    -- a prior run instead of dropping them from consideration.
+    SELECT session_id FROM raw_spans
+    WHERE session_id IS NOT NULL AND ingested_at > :'derive_watermark'::timestamptz
+    UNION
+    SELECT session_id FROM raw_events
+    WHERE session_id IS NOT NULL AND ingested_at > :'derive_watermark'::timestamptz
+),
+
+wait_time AS (
     SELECT
         session_id,
         MAX(issue_key)                     AS issue_key,
@@ -33,6 +55,7 @@ WITH wait_time AS (
     FROM raw_spans
     WHERE span_kind IN ('tool', 'llm_request')
       AND session_id IS NOT NULL
+      AND session_id IN (SELECT session_id FROM touched_sessions)
     GROUP BY session_id
 ),
 
@@ -49,6 +72,7 @@ turn_boundaries AS (
     FROM raw_events
     WHERE event_name IN ('stop', 'user_prompt')
       AND session_id IS NOT NULL
+      AND session_id IN (SELECT session_id FROM touched_sessions)
 ),
 
 active_gaps AS (
@@ -85,6 +109,7 @@ token_cost AS (
     FROM raw_events
     WHERE event_name = 'api_request'
       AND session_id IS NOT NULL
+      AND session_id IN (SELECT session_id FROM touched_sessions)
     GROUP BY session_id
 )
 
@@ -107,12 +132,13 @@ FULL OUTER JOIN active_time a ON a.session_id = w.session_id
 FULL OUTER JOIN token_cost  t ON t.session_id = COALESCE(w.session_id, a.session_id)
 -- issue_key is pinned once a human has promoted an AI-suggested
 -- attribution (session_rollups.attribution_source = 'ai_confirmed') —
--- otherwise this full recompute would silently overwrite a confirmed
--- issue_key back to UNATTRIBUTED on every subsequent ingest run, since
--- the raw OTel tag on the underlying spans/events never changes. Every
--- other column, and attribution_source itself, still recomputes
--- normally — attribution_source isn't listed here at all, so ON
--- CONFLICT leaves it untouched, which is what we want.
+-- otherwise this recompute would silently overwrite a confirmed
+-- issue_key back to UNATTRIBUTED the next time that session's data
+-- happens to be touched again, since the raw OTel tag on the underlying
+-- spans/events never changes. Every other column, and
+-- attribution_source itself, still recomputes normally —
+-- attribution_source isn't listed here at all, so ON CONFLICT leaves it
+-- untouched, which is what we want.
 ON CONFLICT (session_id) DO UPDATE SET
     issue_key       = CASE
                            WHEN session_rollups.attribution_source = 'ai_confirmed'

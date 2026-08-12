@@ -140,15 +140,18 @@ often depends on what you're trading off:
   that window, whatever was unread in a rotated-away file is gone for
   good, silently. Heavier usage rotates sooner than 7 days, so the safe
   margin shrinks with team size, not just time.
-- **Ingestion is incremental**, not a full re-read — each file's
-  (inode, byte offset) is tracked in `ingest_cursors`, so a run only
-  parses what's new since the last one. This makes running it *more*
-  often cheap on the file-reading side specifically. It doesn't make
-  everything cheap: `db/04_derive_session_rollups.sql` still recomputes
-  `session_rollups` from the full `raw_spans`/`raw_events` tables every
-  run, and the Jira auto-fetch still scans for missing keys across the
-  full table each time — both are candidates for the same kind of
-  incremental treatment later, just not built yet.
+- **Ingestion and rollup recomputation are both incremental now**, not a
+  full re-read/recompute. Each file's (inode, byte offset) is tracked in
+  `ingest_cursors`, and `db/04_derive_session_rollups.sql` only
+  re-aggregates sessions with a row ingested since `derive_watermark`
+  (a single timestamp, not per-session bookkeeping — see that table's
+  comment in `db/01_schema.sql`). A session gets its *entire* history
+  re-aggregated when it's in scope, never a partial window — required for
+  the active-time gap calculation's `LAG()` to stay correct across runs,
+  not just an optimization detail. This makes running `npm run ingest`
+  more often cheap on both fronts. The Jira auto-fetch still scans for
+  missing keys across the full table each time — a candidate for the
+  same treatment later, just not built yet.
 - **Rotation is detected safely** (via each file's inode, not just
   whether it's grown) — but detecting a rotation correctly still means
   "start fresh at the new file," not "go recover what I missed." Running
@@ -355,12 +358,14 @@ SET status = 'rejected', reviewed_at = now()
 WHERE suggestion_id = '<uuid>';
 ```
 
-Once confirmed, `attribution_source = 'ai_confirmed'` is pinned —
-`db/04_derive_session_rollups.sql`'s full recompute on every `ingest.js`
-run will keep refreshing everything else about that session (cost,
-active/wait time) but will not revert the promoted `issue_key` back to
-`UNATTRIBUTED`. That's deliberate, not an oversight — see the comment
-right above the `ON CONFLICT` clause in that file before changing it.
+Once confirmed, `attribution_source = 'ai_confirmed'` is pinned — the
+next time `db/04_derive_session_rollups.sql` recomputes that session
+(any time it gets new data — see "How often to run `npm run ingest`"
+above for how recomputation is scoped) it'll keep refreshing everything
+else about it (cost, active/wait time) but will not revert the promoted
+`issue_key` back to `UNATTRIBUTED`. That's deliberate, not an oversight
+— see the comment right above the `ON CONFLICT` clause in that file
+before changing it.
 
 ### Architecture: how the pieces connect, for testing locally
 
