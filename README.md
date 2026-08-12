@@ -140,18 +140,23 @@ often depends on what you're trading off:
   that window, whatever was unread in a rotated-away file is gone for
   good, silently. Heavier usage rotates sooner than 7 days, so the safe
   margin shrinks with team size, not just time.
-- **Ingestion and rollup recomputation are both incremental now**, not a
-  full re-read/recompute. Each file's (inode, byte offset) is tracked in
-  `ingest_cursors`, and `db/04_derive_session_rollups.sql` only
-  re-aggregates sessions with a row ingested since `derive_watermark`
-  (a single timestamp, not per-session bookkeeping — see that table's
-  comment in `db/01_schema.sql`). A session gets its *entire* history
-  re-aggregated when it's in scope, never a partial window — required for
-  the active-time gap calculation's `LAG()` to stay correct across runs,
-  not just an optimization detail. This makes running `npm run ingest`
-  more often cheap on both fronts. The Jira auto-fetch still scans for
-  missing keys across the full table each time — a candidate for the
-  same treatment later, just not built yet.
+- **Ingestion, rollup recomputation, and the Jira auto-fetch scan are all
+  incremental now**, not a full re-read/recompute. Each file's (inode,
+  byte offset) is tracked in `ingest_cursors`; `db/04_derive_session_
+  rollups.sql` only re-aggregates sessions with a row ingested since
+  `derive_watermark` (a session gets its *entire* history re-aggregated
+  when it's in scope, never a partial window — required for the
+  active-time gap calculation's `LAG()` to stay correct across runs, not
+  just an optimization detail); and `reconcileMissingJiraIssues()` only
+  looks for new keys among rows ingested since `jira_reconcile_watermark`
+  (see that table's comment in `db/01_schema.sql`). This makes running
+  `npm run ingest` more often cheap across the board. The Jira watermark
+  has a real, deliberate tradeoff worth knowing: a key that only ever
+  fails to fetch (deleted ticket, typo'd branch name) stops being
+  auto-retried once its underlying row falls behind the watermark —
+  bounded retries for a permanently-broken key, at the cost of not
+  auto-retrying a transient failure (Jira briefly down) once it ages out
+  too. `fetch-ticket.js` is the manual retry path either way.
 - **Rotation is detected safely** (via each file's inode, not just
   whether it's grown) — but detecting a rotation correctly still means
   "start fresh at the new file," not "go recover what I missed." Running

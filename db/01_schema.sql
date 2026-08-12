@@ -237,8 +237,38 @@ CREATE TABLE IF NOT EXISTS git_commits (
     ingested_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_git_commits_session   ON git_commits (session_id);
-CREATE INDEX IF NOT EXISTS idx_git_commits_issue_key ON git_commits (issue_key);
+CREATE INDEX IF NOT EXISTS idx_git_commits_session      ON git_commits (session_id);
+CREATE INDEX IF NOT EXISTS idx_git_commits_issue_key    ON git_commits (issue_key);
+-- Lets reconcileMissingJiraIssues() in ingest.js scope its candidate
+-- search to rows ingested since jira_reconcile_watermark, same reasoning
+-- as raw_spans/raw_events' ingested_at indexes.
+CREATE INDEX IF NOT EXISTS idx_git_commits_ingested_at  ON git_commits (ingested_at);
+
+-- Single-row watermark for reconcileMissingJiraIssues() in ingest.js —
+-- same shape as derive_watermark above, but bootstraps at 'epoch'
+-- (1970-01-01) instead of '-infinity'. Deliberately different: this
+-- watermark is only ever read/written from ingest.js (never needs to
+-- run standalone via psql the way db/04_derive_session_rollups.sql
+-- does), and node-postgres parses '-infinity'/'infinity' as the JS
+-- primitives -Infinity/Infinity, not a Date -- 'epoch' round-trips as a
+-- normal, finite Date with no special-casing needed, and is still
+-- guaranteed earlier than any real telemetry.
+--
+-- Tradeoff, chosen deliberately (see the attribution edge-cases /
+-- reconciliation discussion): once a key's underlying row falls behind
+-- this watermark, it stops being a candidate for auto-fetch — including
+-- a key that only ever failed (Jira down, deleted ticket, typo'd branch
+-- name). That's intentional: it bounds a permanently-broken key to a
+-- finite number of retries instead of hitting the Jira API on every
+-- single run forever. It also means a transient failure won't
+-- auto-retry once it's aged out — fetch-ticket.js remains the manual
+-- escape hatch for that. A cooldown-based retry table is the natural
+-- next step if this tradeoff turns out to bite in practice.
+CREATE TABLE IF NOT EXISTS jira_reconcile_watermark (
+    id              INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    last_checked_at TIMESTAMPTZ NOT NULL DEFAULT 'epoch'
+);
+INSERT INTO jira_reconcile_watermark (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 
 -- ---------------------------------------------------------------------
 -- Ingestion cursors — lets ingest.js resume each landing-zone file from

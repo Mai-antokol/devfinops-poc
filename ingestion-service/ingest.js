@@ -539,6 +539,10 @@ async function ingestGitCommits(filePath, client) {
 // run — same REST API v3 call and field extraction as fetch-ticket.js,
 // duplicated rather than shared, matching how this repo doesn't share
 // code across service directories anywhere else either.
+//
+// Scoped to rows ingested since jira_reconcile_watermark, not a full
+// table scan — see that table's comment in db/01_schema.sql for the
+// retry tradeoff this accepts.
 
 function extractStoryPoints(fields, issueKey) {
   const raw = fields[JIRA_STORY_POINTS_FIELD];
@@ -573,24 +577,53 @@ async function fetchJiraIssue(issueKey) {
 }
 
 async function reconcileMissingJiraIssues(client) {
-  // Issue keys with a real session, event, or commit but no jira_issues
-  // row yet — not scoped to just this run's landing-zone files, so this
-  // also backfills any gap left over from before auto-fetch existed.
-  const { rows } = await client.query(`
-    SELECT DISTINCT seen.issue_key
-    FROM (
-      SELECT issue_key FROM raw_spans   WHERE issue_key IS NOT NULL AND issue_key <> 'UNATTRIBUTED'
-      UNION
-      SELECT issue_key FROM raw_events  WHERE issue_key IS NOT NULL AND issue_key <> 'UNATTRIBUTED'
-      UNION
-      SELECT issue_key FROM git_commits WHERE issue_key IS NOT NULL AND issue_key <> 'UNATTRIBUTED'
-    ) seen
-    WHERE NOT EXISTS (SELECT 1 FROM jira_issues ji WHERE ji.issue_key = seen.issue_key)
-  `);
+  // Captured before the scan, not after — same reasoning as
+  // derive_watermark's runStartedAt: anything ingested between "we read
+  // the watermark" and "we finish this run" should still be in scope
+  // next time, not skipped because this run's success advanced the
+  // watermark past it.
+  const runStartedAt = new Date();
+  const { rows: watermarkRows } = await client.query(
+    'SELECT last_checked_at FROM jira_reconcile_watermark WHERE id = 1'
+  );
+  const watermark = watermarkRows[0]?.last_checked_at ?? new Date(0);
 
-  if (rows.length === 0) return { fetched: 0, failed: 0 };
+  // Scoped to rows ingested since the watermark, not the full table —
+  // see the jira_reconcile_watermark comment in db/01_schema.sql for
+  // the tradeoff this accepts: a key that only ever fails to fetch
+  // stops being retried once its row falls behind the watermark,
+  // deliberately, so a permanently-broken key doesn't hit the Jira API
+  // forever. fetch-ticket.js is the manual retry path for that case.
+  const { rows } = await client.query(
+    `SELECT DISTINCT seen.issue_key
+     FROM (
+       SELECT issue_key FROM raw_spans   WHERE issue_key IS NOT NULL AND issue_key <> 'UNATTRIBUTED' AND ingested_at > $1
+       UNION
+       SELECT issue_key FROM raw_events  WHERE issue_key IS NOT NULL AND issue_key <> 'UNATTRIBUTED' AND ingested_at > $1
+       UNION
+       SELECT issue_key FROM git_commits WHERE issue_key IS NOT NULL AND issue_key <> 'UNATTRIBUTED' AND ingested_at > $1
+     ) seen
+     WHERE NOT EXISTS (SELECT 1 FROM jira_issues ji WHERE ji.issue_key = seen.issue_key)`,
+    [watermark]
+  );
+
+  if (rows.length === 0) {
+    // Nothing found — genuinely nothing to retry later either way, so
+    // it's safe to advance regardless of credentials being configured.
+    await client.query(
+      'UPDATE jira_reconcile_watermark SET last_checked_at = $1 WHERE id = 1',
+      [runStartedAt]
+    );
+    return { fetched: 0, failed: 0 };
+  }
 
   if (!JIRA_HOST || !JIRA_USER_EMAIL || !JIRA_API_TOKEN) {
+    // Deliberately NOT advancing the watermark here. Missing credentials
+    // is a config problem, not a per-key failure — it's very likely
+    // temporary (someone adds JIRA_API_TOKEN to .env later), and every
+    // key seen during this gap should still be caught on the first run
+    // after that happens, not silently lost the way a genuinely
+    // per-key-broken fetch is allowed to be.
     console.warn(
       `[ingest] ${rows.length} issue key(s) have no jira_issues row yet ` +
         `(${rows.map((r) => r.issue_key).join(', ')}) — JIRA_HOST/JIRA_USER_EMAIL/JIRA_API_TOKEN ` +
@@ -633,6 +666,15 @@ async function reconcileMissingJiraIssues(client) {
       failed += 1;
     }
   }
+
+  // Advances even if some keys in `failed` above never resolved — that's
+  // the accepted option-1 tradeoff (see the schema comment): bounded
+  // retries for a permanently-broken key, at the cost of not
+  // auto-retrying a transient failure once it ages out.
+  await client.query(
+    'UPDATE jira_reconcile_watermark SET last_checked_at = $1 WHERE id = 1',
+    [runStartedAt]
+  );
 
   return { fetched, failed };
 }
