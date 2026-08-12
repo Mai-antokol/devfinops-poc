@@ -206,7 +206,7 @@
         {
           "refId": "A",
           "format": "table",
-          "rawSql": "SELECT issue_key, active_time_hours, wait_time_hours FROM ticket_rollup ORDER BY (active_time_hours + wait_time_hours) DESC LIMIT 25;"
+          "rawSql": "SELECT CASE WHEN LENGTH(issue_key || ': ' || COALESCE(summary, '(no summary)')) > 50 THEN LEFT(issue_key || ': ' || COALESCE(summary, '(no summary)'), 49) || '…' ELSE issue_key || ': ' || COALESCE(summary, '(no summary)') END AS ticket, active_time_hours, wait_time_hours FROM ticket_rollup ORDER BY (active_time_hours + wait_time_hours) DESC LIMIT 25;"
         }
       ]
     },
